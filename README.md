@@ -26,6 +26,11 @@ claudex
 permission confirmations and should only be used in environments where you
 accept that risk.
 
+Claudex uses Claude Code's normal `~/.claude` configuration. Your existing MCP
+servers, skills, plugins, settings, projects, and history remain available. The
+launcher adds temporary session settings only for the local proxy connection;
+it does not create or switch to a separate Claude configuration directory.
+
 ## Models
 
 - GPT-5.4
