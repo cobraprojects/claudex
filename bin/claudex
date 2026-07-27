@@ -1,0 +1,80 @@
+#!/bin/sh
+set -eu
+
+base_url="http://127.0.0.1:18765"
+proxy="$HOME/.local/share/claudex/bin/claude-code-proxy"
+label="com.cobraprojects.claudex-proxy"
+
+proxy_ready() {
+  curl -fsS --max-time 2 "$base_url/healthz" >/dev/null 2>&1
+}
+
+start_proxy() {
+  case "$(uname -s)" in
+    Darwin)
+      launchctl kickstart -k "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+      ;;
+    Linux)
+      if command -v systemctl >/dev/null 2>&1 \
+        && systemctl --user show-environment >/dev/null 2>&1; then
+        systemctl --user restart claudex-proxy.service >/dev/null 2>&1 || true
+      else
+        mkdir -p "$HOME/.local/state/claudex-proxy"
+        nohup "$proxy" serve --no-monitor \
+          >>"$HOME/.local/state/claudex-proxy/service.log" 2>&1 &
+      fi
+      ;;
+  esac
+}
+
+if ! proxy_ready; then
+  start_proxy
+  attempt=0
+  while ! proxy_ready; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 20 ]; then
+      echo "claudex: the local proxy did not start" >&2
+      exit 1
+    fi
+    sleep 0.25
+  done
+fi
+
+models="$(curl -fsS --max-time 3 "$base_url/v1/models?limit=1000")"
+for model in \
+  claude-gpt-5.4 \
+  claude-gpt-5.5 \
+  claude-gpt-5.6-luna \
+  claude-gpt-5.6-terra \
+  claude-gpt-5.6-sol
+do
+  case "$models" in
+    *"\"id\":\"$model\""*) ;;
+    *)
+      echo "claudex: GPT model discovery is unavailable; reinstall with:" >&2
+      echo "curl -fsSL https://raw.githubusercontent.com/cobraprojects/claudex/main/install.sh | bash" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if command -v claude >/dev/null 2>&1; then
+  claude_bin="$(command -v claude)"
+elif [ -x "$HOME/.local/bin/claude" ]; then
+  claude_bin="$HOME/.local/bin/claude"
+else
+  echo "claudex: Claude Code is not installed" >&2
+  exit 1
+fi
+
+exec env -u ANTHROPIC_API_KEY \
+  CLAUDE_CONFIG_DIR="$HOME/.claudex" \
+  ANTHROPIC_BASE_URL="$base_url" \
+  ANTHROPIC_AUTH_TOKEN=unused \
+  ANTHROPIC_MODEL=claude-gpt-5.6-sol \
+  ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna \
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
+  CLAUDE_CODE_USE_GATEWAY=1 \
+  CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
+  CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+  "$claude_bin" --dangerously-skip-permissions "$@"

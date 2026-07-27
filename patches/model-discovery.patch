@@ -1,0 +1,68 @@
+diff --git a/src/registry.rs b/src/registry.rs
+index 1e70f38..f083c98 100644
+--- a/src/registry.rs
++++ b/src/registry.rs
+@@ -174,10 +174,15 @@ impl Registry {
+ 
+ pub fn normalize_incoming_model(model: &str) -> String {
+     let suffix = "[1m]";
+-    if model.len() >= suffix.len() && model.to_ascii_lowercase().ends_with(suffix) {
+-        return model[..model.len() - suffix.len()].to_string();
+-    }
+-    model.to_string()
++    let without_hint =
++        if model.len() >= suffix.len() && model.to_ascii_lowercase().ends_with(suffix) {
++            &model[..model.len() - suffix.len()]
++        } else {
++            model
++        };
++    without_hint
++        .strip_prefix("claude-gpt-")
++        .map_or_else(|| without_hint.to_string(), |rest| format!("gpt-{rest}"))
+ }
+ 
+ pub fn is_anthropic_alias(model: &str) -> bool {
+@@ -321,6 +326,14 @@ mod tests {
+     fn normalize_model_trims_hint() {
+         assert_eq!(normalize_incoming_model("gpt-5.4-fast[1m]"), "gpt-5.4-fast");
+         assert_eq!(normalize_incoming_model("gpt-5.4-fast"), "gpt-5.4-fast");
++        assert_eq!(
++            normalize_incoming_model("claude-gpt-5.6-sol"),
++            "gpt-5.6-sol"
++        );
++        assert_eq!(
++            normalize_incoming_model("claude-gpt-5.6-sol[1m]"),
++            "gpt-5.6-sol"
++        );
+     }
+ 
+     #[test]
+diff --git a/src/server.rs b/src/server.rs
+index d521980..4ad794e 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -167,6 +167,24 @@ async fn handler_models(
+             })
+         })
+         .collect();
++    // Claude Code filters gateway model IDs that do not begin with `claude`
++    // or `anthropic`. Advertise stable compatibility aliases for the Codex
++    // models used by claudex; normalize_incoming_model strips the prefix
++    // before provider routing.
++    for model in [
++        "gpt-5.4",
++        "gpt-5.5",
++        "gpt-5.6-luna",
++        "gpt-5.6-terra",
++        "gpt-5.6-sol",
++    ] {
++        data.push(json!({
++            "type": "model",
++            "id": format!("claude-{model}"),
++            "display_name": model,
++        }));
++    }
++    data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+     let has_more = query.limit.is_some_and(|limit| data.len() > limit);
+     if let Some(limit) = query.limit {
+         data.truncate(limit);
