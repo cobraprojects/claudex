@@ -42,6 +42,12 @@ it does not create or switch to a separate Claude configuration directory.
 Use `/model` inside Claude Code to switch models and `/effort` to choose the
 reasoning effort.
 
+## Up next
+
+- Native Windows support: a Windows proxy executable, PowerShell installer,
+  `claudex` launcher, startup/service integration, and signed release assets.
+  Until then, Windows users can run the Linux installer inside WSL2.
+
 ## Updating
 
 Run the installer again. It replaces only the isolated Claudex proxy and
