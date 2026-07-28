@@ -7,6 +7,12 @@ local compatibility proxy.
 
 Supported: macOS and Linux on Apple Silicon/ARM64 and Intel/AMD64.
 
+On Debian or Ubuntu, install the required command-line tools first:
+
+```bash
+sudo apt install curl tar coreutils
+```
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cobraprojects/claudex/main/install.sh | bash
 ```
