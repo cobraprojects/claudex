@@ -9,6 +9,7 @@ bin_dir="$HOME/.local/bin"
 proxy="$install_root/bin/claude-code-proxy"
 launcher="$bin_dir/claudex"
 label="com.cobraprojects.claudex-proxy"
+minimum_claude_version="2.1.219"
 
 say() {
   printf '%s\n' "claudex: $*"
@@ -17,6 +18,18 @@ say() {
 fail() {
   printf '%s\n' "claudex: $*" >&2
   exit 1
+}
+
+version_at_least() {
+  awk -v current="$1" -v required="$2" 'BEGIN {
+    split(current, c, ".")
+    split(required, r, ".")
+    for (i = 1; i <= 3; i++) {
+      if ((c[i] + 0) > (r[i] + 0)) exit 0
+      if ((c[i] + 0) < (r[i] + 0)) exit 1
+    }
+    exit 0
+  }'
 }
 
 command -v curl >/dev/null 2>&1 || fail "curl is required"
@@ -156,6 +169,20 @@ export PATH="$bin_dir:$PATH"
 if ! command -v claude >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/claude" ]; then
   say "installing Claude Code using Anthropic's official installer"
   curl -fsSL https://claude.ai/install.sh | bash
+fi
+
+if command -v claude >/dev/null 2>&1; then
+  claude_bin="$(command -v claude)"
+else
+  claude_bin="$HOME/.local/bin/claude"
+fi
+claude_version="$("$claude_bin" --version | awk '{print $1}')"
+if ! version_at_least "$claude_version" "$minimum_claude_version"; then
+  say "updating Claude Code $claude_version for GPT model slots and Ultracode workflows"
+  "$claude_bin" update
+  claude_version="$("$claude_bin" --version | awk '{print $1}')"
+  version_at_least "$claude_version" "$minimum_claude_version" \
+    || fail "Claude Code $minimum_claude_version or newer is required"
 fi
 
 if "$proxy" codex auth status >/dev/null 2>&1; then
