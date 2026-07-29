@@ -19,8 +19,10 @@ curl -fsSL https://raw.githubusercontent.com/cobraprojects/claudex/main/install.
 
 The installer downloads a checksum-verified precompiled binary from GitHub
 Releases, configures a per-user background service, installs Claude Code from
-Anthropic's official installer when necessary, and opens the ChatGPT login
-flow. Client machines do **not** need Rust, a compiler, or Homebrew.
+Anthropic's official installer when necessary, updates Claude Code if it is too
+old for the five model slots, and opens the ChatGPT login flow. Client machines
+do **not** need Rust, a compiler, or Homebrew. Claude Code is not pinned; the
+installer only requires version 2.1.219 or newer.
 
 After installation, open a new terminal and run:
 
@@ -47,6 +49,17 @@ it does not create or switch to a separate Claude configuration directory.
 
 Use `/model` inside Claude Code to switch models and `/effort` to choose the
 reasoning effort.
+
+## Ultracode workflows
+
+Every GPT model is declared as supporting Claude Code's reasoning and dynamic
+workflow capabilities. Run `/effort ultracode`, or include `ultracode` in a
+prompt, to enable the session-only mode. Ultracode is a workflow-orchestration
+mode, not a thinking level: it manages subagents through dynamic workflows and
+uses xhigh reasoning underneath.
+
+Claudex uses Claude Code's five configurable model slots to expose all five GPT
+models without duplicate gateway entries. GPT-5.6 Sol is the default.
 
 ## Up next
 
