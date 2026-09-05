@@ -42,6 +42,7 @@ jobs:
           git -C upstream apply "$GITHUB_WORKSPACE/patches/model-discovery.patch"
           cargo fmt --manifest-path upstream/Cargo.toml --check
           cargo test --manifest-path upstream/Cargo.toml normalize_model_trims_hint --lib
+          cargo test --manifest-path upstream/Cargo.toml allowed_models_accept_base --lib
           cargo build --manifest-path upstream/Cargo.toml --release --locked
 
       - name: Package

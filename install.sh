@@ -9,7 +9,7 @@ bin_dir="$HOME/.local/bin"
 proxy="$install_root/bin/claude-code-proxy"
 launcher="$bin_dir/claudex"
 label="com.cobraprojects.claudex-proxy"
-minimum_claude_version="2.1.219"
+minimum_claude_version="2.1.261"
 
 say() {
   printf '%s\n' "claudex: $*"
@@ -146,7 +146,7 @@ until curl -fsS --max-time 2 "$base_url/healthz" >/dev/null 2>&1; do
 done
 
 models="$(curl -fsS --max-time 3 "$base_url/v1/models?limit=1000")"
-for model in claude-gpt-5.4 claude-gpt-5.5 claude-gpt-5.6-luna claude-gpt-5.6-terra claude-gpt-5.6-sol; do
+for model in claude-gpt-5.4 claude-gpt-5.5 claude-gpt-5.6-luna claude-gpt-5.6-terra claude-gpt-5.6-sol claude-gpt-6-astra; do
   case "$models" in
     *"\"id\":\"$model\""*) ;;
     *) fail "installed proxy did not advertise $model" ;;
@@ -178,7 +178,7 @@ else
 fi
 claude_version="$("$claude_bin" --version | awk '{print $1}')"
 if ! version_at_least "$claude_version" "$minimum_claude_version"; then
-  say "updating Claude Code $claude_version for GPT model slots and Ultracode workflows"
+  say "updating Claude Code $claude_version for dynamic GPT discovery and Ultracode workflows"
   "$claude_bin" update
   claude_version="$("$claude_bin" --version | awk '{print $1}')"
   version_at_least "$claude_version" "$minimum_claude_version" \

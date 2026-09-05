@@ -1,8 +1,48 @@
+diff --git a/src/providers/codex/translate/model_allowlist.rs b/src/providers/codex/translate/model_allowlist.rs
+index bb4c062..086063f 100644
+--- a/src/providers/codex/translate/model_allowlist.rs
++++ b/src/providers/codex/translate/model_allowlist.rs
+@@ -14,6 +14,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
+     "gpt-5.6-luna",
+     "gpt-5.6-sol",
+     "gpt-5.6-terra",
++    "gpt-6-astra",
+ ];
+ 
+ pub const MODEL_ALIASES: &[(&str, &str)] = &[
+@@ -117,7 +118,10 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
+ }
+ 
+ pub fn uses_responses_lite(model: &str) -> bool {
+-    matches!(model, "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra")
++    matches!(
++        model,
++        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
++    )
+ }
+ 
+ /// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
+@@ -207,6 +211,7 @@ mod tests {
+         assert!(assert_allowed_model("gpt-5.4").is_ok());
+         assert!(assert_allowed_model("gpt-5.6-sol").is_ok());
+         assert!(assert_allowed_model("gpt-5.6-terra").is_ok());
++        assert!(assert_allowed_model("gpt-6-astra").is_ok());
+         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
+     }
+ 
 diff --git a/src/registry.rs b/src/registry.rs
-index 1e70f38..f083c98 100644
+index 77a9cf6..012a1d6 100644
 --- a/src/registry.rs
 +++ b/src/registry.rs
-@@ -174,10 +174,15 @@ impl Registry {
+@@ -46,6 +46,7 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
+     "gpt-5.6-luna",
+     "gpt-5.6-sol",
+     "gpt-5.6-terra",
++    "gpt-6-astra",
+ ];
+ 
+ pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
+@@ -198,10 +198,15 @@ impl Registry {
  
  pub fn normalize_incoming_model(model: &str) -> String {
      let suffix = "[1m]";
@@ -22,46 +62,52 @@ index 1e70f38..f083c98 100644
  }
  
  pub fn is_anthropic_alias(model: &str) -> bool {
-@@ -321,6 +326,14 @@ mod tests {
+@@ -344,6 +349,14 @@ mod tests {
      fn normalize_model_trims_hint() {
          assert_eq!(normalize_incoming_model("gpt-5.4-fast[1m]"), "gpt-5.4-fast");
          assert_eq!(normalize_incoming_model("gpt-5.4-fast"), "gpt-5.4-fast");
 +        assert_eq!(
-+            normalize_incoming_model("claude-gpt-5.6-sol"),
-+            "gpt-5.6-sol"
++            normalize_incoming_model("claude-gpt-6-astra"),
++            "gpt-6-astra"
 +        );
 +        assert_eq!(
-+            normalize_incoming_model("claude-gpt-5.6-sol[1m]"),
-+            "gpt-5.6-sol"
++            normalize_incoming_model("claude-gpt-future[1m]"),
++            "gpt-future"
 +        );
      }
  
      #[test]
 diff --git a/src/server.rs b/src/server.rs
-index d521980..4ad794e 100644
+index bb563d9..1abc019 100644
 --- a/src/server.rs
 +++ b/src/server.rs
-@@ -167,6 +167,24 @@ async fn handler_models(
-             })
+@@ -323,15 +323,26 @@ async fn handler_models(
+         .registry
+         .all_supported_models()
+         .into_iter()
+-        .map(|(model, provider)| {
+-            json!({
++        .flat_map(|(model, provider)| {
++            let raw = json!({
+                 "type": "model",
+                 "object": "model",
+-                "id": model,
++                "id": &model,
+                 "display_name": format!("{model} ({provider})"),
+-            })
++            });
++            let compatibility_alias =
++                (provider == "codex" && model.starts_with("gpt-")).then(|| {
++                    json!({
++                        "type": "model",
++                        "object": "model",
++                        "id": format!("claude-{model}"),
++                        "display_name": &model,
++                    })
++                });
++            std::iter::once(raw).chain(compatibility_alias)
          })
          .collect();
-+    // Claude Code filters gateway model IDs that do not begin with `claude`
-+    // or `anthropic`. Advertise stable compatibility aliases for the Codex
-+    // models used by claudex; normalize_incoming_model strips the prefix
-+    // before provider routing.
-+    for model in [
-+        "gpt-5.4",
-+        "gpt-5.5",
-+        "gpt-5.6-luna",
-+        "gpt-5.6-terra",
-+        "gpt-5.6-sol",
-+    ] {
-+        data.push(json!({
-+            "type": "model",
-+            "id": format!("claude-{model}"),
-+            "display_name": model,
-+        }));
-+    }
 +    data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
      let has_more = query.limit.is_some_and(|limit| data.len() > limit);
      if let Some(limit) = query.limit {
