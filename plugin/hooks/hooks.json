@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "UserPromptExpansion": [
+      {
+        "matcher": "^(claudex:)?gpt-login$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/gpt-auth-hook",
+            "args": ["login"],
+            "timeout": 330,
+            "statusMessage": "Waiting for GPT browser authorization"
+          }
+        ]
+      },
+      {
+        "matcher": "^(claudex:)?gpt-logout$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/gpt-auth-hook",
+            "args": ["logout"],
+            "timeout": 30,
+            "statusMessage": "Signing out of GPT"
+          }
+        ]
+      }
+    ]
+  }
+}

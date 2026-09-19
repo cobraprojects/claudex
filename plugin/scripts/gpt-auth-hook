@@ -1,0 +1,74 @@
+#!/bin/sh
+set -u
+
+plugin_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+auth="${CLAUDEX_GPT_AUTH:-$plugin_root/scripts/gpt-auth}"
+
+block() {
+  printf '{"decision":"block","reason":"%s"}\n' "$1"
+}
+
+open_browser() {
+  if [ -n "${CLAUDEX_BROWSER_OPEN:-}" ]; then
+    "$CLAUDEX_BROWSER_OPEN" "$1"
+    return
+  fi
+
+  case "$(uname -s)" in
+    Darwin)
+      open "$1" >/dev/null 2>&1
+      ;;
+    Linux)
+      if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$1" >/dev/null 2>&1
+      elif command -v gio >/dev/null 2>&1; then
+        gio open "$1" >/dev/null 2>&1
+      else
+        return 1
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+case "${1:-}" in
+  logout)
+    if "$auth" logout >/dev/null 2>&1; then
+      block "GPT logout succeeded. Run /gpt-login to sign in with another account."
+    else
+      block "GPT logout failed."
+    fi
+    ;;
+  login)
+    login_output="$(mktemp "${TMPDIR:-/tmp}/claudex-login.XXXXXX")"
+    trap 'rm -f "$login_output"' EXIT HUP INT TERM
+
+    "$auth" login >"$login_output" 2>&1 &
+    auth_pid=$!
+    auth_url=""
+
+    while kill -0 "$auth_pid" >/dev/null 2>&1; do
+      auth_url="$(sed -n 's/^[[:space:]]*\(https:\/\/[^[:space:]]*\)[[:space:]]*$/\1/p' "$login_output" | head -n 1)"
+      [ -z "$auth_url" ] || break
+      sleep 0.1
+    done
+
+    if [ -z "$auth_url" ] || ! open_browser "$auth_url"; then
+      kill "$auth_pid" >/dev/null 2>&1 || true
+      wait "$auth_pid" >/dev/null 2>&1 || true
+      block "GPT login could not open a browser."
+      exit 0
+    fi
+
+    if wait "$auth_pid"; then
+      block "GPT login succeeded."
+    else
+      block "GPT login failed or timed out."
+    fi
+    ;;
+  *)
+    block "Unknown GPT authentication command."
+    ;;
+esac

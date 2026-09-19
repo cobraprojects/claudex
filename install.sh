@@ -81,7 +81,7 @@ install -m 0755 "$tmp/claude-code-proxy" "$proxy"
 install -m 0755 "$tmp/claudex" "$launcher"
 rm -rf "$plugin"
 cp -R "$tmp/plugin" "$plugin"
-chmod 0755 "$plugin/scripts/gpt-auth"
+chmod 0755 "$plugin/scripts/gpt-auth" "$plugin/scripts/gpt-auth-hook"
 
 # Stop the Homebrew-managed proxy if a previous experimental installation is
 # occupying the same port. The standalone claudex binary is not managed by brew.
