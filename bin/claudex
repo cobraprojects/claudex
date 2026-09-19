@@ -61,12 +61,24 @@ else
   exit 1
 fi
 
-default_model="claude-gpt-6-astra"
-if ! printf '%s\n' "$model_ids" | grep -Fxq "$default_model"; then
-  default_model="claude-gpt-5.6-sol"
+saved_model=""
+if [ -f "$HOME/.claude/settings.json" ]; then
+  saved_model="$(tr ',' '\n' <"$HOME/.claude/settings.json" \
+    | sed -n 's/.*"model"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n 1)"
 fi
-if ! printf '%s\n' "$model_ids" | grep -Fxq "$default_model"; then
-  default_model="$(printf '%s\n' "$model_ids" | tail -n 1)"
+
+if [ -n "$saved_model" ] \
+  && printf '%s\n' "$model_ids" | grep -Fxq "$saved_model"; then
+  startup_model="$saved_model"
+else
+  startup_model="claude-gpt-6-astra"
+  if ! printf '%s\n' "$model_ids" | grep -Fxq "$startup_model"; then
+    startup_model="claude-gpt-5.6-sol"
+  fi
+  if ! printf '%s\n' "$model_ids" | grep -Fxq "$startup_model"; then
+    startup_model="$(printf '%s\n' "$model_ids" | tail -n 1)"
+  fi
 fi
 
 model_options=""
@@ -89,7 +101,7 @@ $model_ids
 EOF
 
 session_settings="$(printf '%s' \
-  "{\"enableWorkflows\":true,\"modelPicker\":{\"replaceBuiltInOptions\":true,\"options\":[$model_options]},\"env\":{\"ANTHROPIC_BASE_URL\":\"$base_url\",\"ANTHROPIC_AUTH_TOKEN\":\"unused\",\"ANTHROPIC_MODEL\":\"$default_model\",\"CLAUDE_CODE_AUTO_COMPACT_WINDOW\":\"272000\",\"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY\":\"0\",\"CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK\":\"1\",\"CLAUDE_CODE_WORKFLOWS\":\"1\"}}")"
+  "{\"enableWorkflows\":true,\"modelPicker\":{\"replaceBuiltInOptions\":true,\"options\":[$model_options]},\"env\":{\"ANTHROPIC_BASE_URL\":\"$base_url\",\"ANTHROPIC_AUTH_TOKEN\":\"unused\",\"ANTHROPIC_MODEL\":\"$startup_model\",\"CLAUDE_CODE_AUTO_COMPACT_WINDOW\":\"272000\",\"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY\":\"0\",\"CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK\":\"1\",\"CLAUDE_CODE_WORKFLOWS\":\"1\"}}")"
 
 # An empty API key still counts as configured in recent Claude Code versions.
 unset ANTHROPIC_API_KEY
@@ -101,7 +113,7 @@ unset ANTHROPIC_API_KEY
 exec env \
   ANTHROPIC_BASE_URL="$base_url" \
   ANTHROPIC_AUTH_TOKEN=unused \
-  ANTHROPIC_MODEL="$default_model" \
+  ANTHROPIC_MODEL="$startup_model" \
   CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 \
   CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
