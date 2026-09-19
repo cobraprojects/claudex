@@ -1,0 +1,11 @@
+{
+  "name": "claudex",
+  "displayName": "Claudex",
+  "description": "GPT account management for Claudex",
+  "version": "1.0.0",
+  "author": {
+    "name": "Cobra Projects"
+  },
+  "repository": "https://github.com/cobraprojects/claudex",
+  "license": "MIT"
+}

@@ -7,6 +7,7 @@ base_url="http://127.0.0.1:18765"
 install_root="$HOME/.local/share/claudex"
 bin_dir="$HOME/.local/bin"
 proxy="$install_root/bin/claude-code-proxy"
+plugin="$install_root/plugin"
 launcher="$bin_dir/claudex"
 label="com.cobraprojects.claudex-proxy"
 minimum_claude_version="2.1.261"
@@ -74,8 +75,13 @@ fi
 
 mkdir -p "$install_root/bin" "$bin_dir" "$HOME/.local/state/claudex-proxy"
 tar -xzf "$tmp/$asset" -C "$tmp"
+[ -f "$tmp/plugin/.claude-plugin/plugin.json" ] \
+  || fail "release is missing the Claudex plugin"
 install -m 0755 "$tmp/claude-code-proxy" "$proxy"
 install -m 0755 "$tmp/claudex" "$launcher"
+rm -rf "$plugin"
+cp -R "$tmp/plugin" "$plugin"
+chmod 0755 "$plugin/scripts/gpt-auth"
 
 # Stop the Homebrew-managed proxy if a previous experimental installation is
 # occupying the same port. The standalone claudex binary is not managed by brew.

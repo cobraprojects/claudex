@@ -30,6 +30,16 @@ After installation, open a new terminal and run:
 claudex
 ```
 
+Inside Claudex, manage the ChatGPT account used for GPT models with:
+
+```text
+/gpt-login
+/gpt-logout
+```
+
+These commands are bundled with Claudex and are available to every user after
+installing or updating.
+
 `claudex` starts Claude Code with `--dangerously-skip-permissions`. This disables
 permission confirmations and should only be used in environments where you
 accept that risk.

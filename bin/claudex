@@ -3,6 +3,7 @@ set -eu
 
 base_url="${CLAUDEX_BASE_URL:-http://127.0.0.1:18765}"
 proxy="$HOME/.local/share/claudex/bin/claude-code-proxy"
+plugin="$HOME/.local/share/claudex/plugin"
 label="com.cobraprojects.claudex-proxy"
 
 proxy_ready() {
@@ -105,4 +106,5 @@ exec env \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 \
   CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   CLAUDE_CODE_WORKFLOWS=1 \
-  "$claude_bin" --settings "$session_settings" --dangerously-skip-permissions "$@"
+  "$claude_bin" --plugin-dir "$plugin" --settings "$session_settings" \
+  --dangerously-skip-permissions "$@"
