@@ -14,7 +14,7 @@ async function launch(t, models, savedModel, status = 200, options = {}) {
   const home = await mkdtemp(join(tmpdir(), 'claudex-launcher-'));
   t.after(() => rm(home, { recursive: true, force: true }));
   await mkdir(join(home, 'bin'));
-  await writeFile(join(home, 'bin', 'claude'), '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o755 });
+  await writeFile(join(home, 'bin', 'claude'), '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify(process.argv.slice(2)));\n', { mode: 0o755 });
   const installRoot = join(home, '.local/share/claudex');
   await mkdir(join(installRoot, 'bin'), { recursive: true });
   await mkdir(join(installRoot, 'plugin/scripts'), { recursive: true });
@@ -64,7 +64,9 @@ touch "$HOME/.authenticated"
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
-  const { stdout, stderr } = await exec('/bin/sh', options.hook ? [resolve('plugin/scripts/gpt-auth-hook'), 'login'] : [launcher], {
+  if (options.settingsFile) await writeFile(join(home, 'sdk-settings.json'), options.settingsFile);
+  const cliArgs = options.settingsFile ? ['--settings', join(home, 'sdk-settings.json')] : options.cliArgs ?? [];
+  const { stdout, stderr } = await exec('/bin/sh', options.hook ? [resolve('plugin/scripts/gpt-auth-hook'), 'login'] : [launcher, ...cliArgs], {
     timeout: 10000,
     env: { ...process.env, HOME: home, PATH: `${join(home, 'bin')}:${process.env.PATH}`,
       CLAUDEX_BASE_URL: `http://127.0.0.1:${server.address().port}`,
@@ -73,11 +75,40 @@ touch "$HOME/.authenticated"
   });
   if (options.verify) await options.verify({ home, catalogRequests, stdout, stderr });
   if (options.hook) return JSON.parse(stdout.trim());
-  const args = stdout.trim().split('\n');
+  const args = JSON.parse(stdout);
   return JSON.parse(args[args.indexOf('--settings') + 1]);
 }
 
 const model = (id, isDefault = false) => ({ id: `claude-${id}`, is_default: isDefault });
+
+test('SDK settings retain GPT discovery and preserve the SDK controls', { concurrency: true }, async t => {
+  const settings = await launch(t, [model('gpt-next', true)], undefined, 200, {
+    cliArgs: ['--settings', '{"disableAllHooks":true,"alwaysThinkingEnabled":false}', '--verbose'],
+    verify({ stdout }) {
+      const args = JSON.parse(stdout);
+      assert.equal(args.filter(arg => arg === '--settings').length, 1);
+      assert.ok(args.includes('--verbose'));
+    },
+  });
+  assert.equal(settings.disableAllHooks, true);
+  assert.equal(settings.alwaysThinkingEnabled, false);
+  assert.equal(settings.modelPicker.options[0].model, 'claude-gpt-next');
+  assert.equal(settings.modelPicker.options[0].behavesAs, 'claude-fable-5-1');
+});
+
+test('settings files and repeated inline settings keep their last values', { concurrency: true }, async t => {
+  const settings = await launch(t, [model('gpt-next', true)], undefined, 200, {
+    settingsFile: '\n {\n "disableAllHooks": true, "language": "English"\n }\n',
+  });
+  assert.equal(settings.disableAllHooks, true);
+  assert.equal(settings.language, 'English');
+  assert.equal(settings.modelPicker.options[0].model, 'claude-gpt-next');
+  const repeated = await launch(t, [model('gpt-next', true)], undefined, 200, {
+    cliArgs: ['--settings={"language":"English"}', '--settings', '{}', '--settings', '{"language":"Arabic"}'],
+  });
+  assert.equal(repeated.language, 'Arabic');
+  assert.equal(repeated.modelPicker.options[0].model, 'claude-gpt-next');
+});
 
 test('new catalog models appear and the service chooses the default', { concurrency: true }, async t => {
   const settings = await launch(t, [model('gpt-z-old'), model('gpt-next_future', true), model('gpt-next_future-fast')]);

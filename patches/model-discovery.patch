@@ -218,10 +218,10 @@ index c09f930..47dc969 100644
          if let Err(e) = assert_allowed_model(&resolved.model) {
 diff --git a/src/providers/codex/models.rs b/src/providers/codex/models.rs
 new file mode 100644
-index 0000000..6241acd
+index 0000000..e4f1b33
 --- /dev/null
 +++ b/src/providers/codex/models.rs
-@@ -0,0 +1,686 @@
+@@ -0,0 +1,751 @@
 +//! The authenticated Codex catalog is the source of model IDs and lane metadata.
 +use std::sync::{LazyLock, RwLock};
 +use std::time::{Duration, Instant};
@@ -315,12 +315,54 @@ index 0000000..6241acd
 +        entry["object"] = json!("model");
 +        entry["owned_by"] = json!("openai");
 +        entry["is_default"] = json!(is_default);
++        entry["created_at"] = json!("1970-01-01T00:00:00Z");
++        entry["max_input_tokens"] = self
++            .metadata
++            .get("context_window")
++            .cloned()
++            .unwrap_or(Value::Null);
++        entry["max_tokens"] = Value::Null;
++        entry["capabilities"] = Value::Null;
 +        if id.starts_with("claude-") {
 +            entry["behaves_as"] = json!("claude-fable-5-1");
 +        }
 +        // Codex's preset API calls these "efforts"; expose both spellings for clients.
 +        if let Some(levels) = &self.supported_reasoning_levels {
 +            entry["supported_reasoning_efforts"] = json!(levels);
++            let mut effort = Map::from_iter([("supported".into(), json!(!levels.is_empty()))]);
++            for level in ["low", "medium", "high", "xhigh", "max"] {
++                effort.insert(
++                    level.into(),
++                    json!({"supported": levels.iter().any(|item| item.effort == level)}),
++                );
++            }
++            let image_input = self
++                .metadata
++                .get("input_modalities")
++                .and_then(Value::as_array)
++                .is_some_and(|modalities| modalities.iter().any(|item| item == "image"));
++            // Claude Models API capabilities describe this compatibility surface.
++            // Reasoning is selected through effort; Claude thinking budgets are
++            // not implemented by the Codex translation layer.
++            entry["capabilities"] = json!({
++                "effort": effort,
++                "batch": {"supported": false},
++                "citations": {"supported": false},
++                "code_execution": {"supported": false},
++                "context_management": {
++                    "supported": false,
++                    "clear_thinking_20251015": null,
++                    "clear_tool_uses_20250919": null,
++                    "compact_20260112": null
++                },
++                "image_input": {"supported": image_input},
++                "pdf_input": {"supported": false},
++                "structured_outputs": {"supported": true},
++                "thinking": {
++                    "supported": false,
++                    "types": {"adaptive": {"supported": false}, "enabled": {"supported": false}}
++                }
++            });
 +        }
 +        if let Some(default) = &self.default_reasoning_level {
 +            entry["default_reasoning_effort"] = json!(default);
@@ -771,6 +813,13 @@ index 0000000..6241acd
 +        assert!(body["data"].as_array().unwrap().iter().any(|entry|
 +            entry["id"] == "claude-gpt-future-test" && entry["is_default"] == true));
 +
++        for entry in body["data"].as_array().unwrap() {
++            assert_eq!(entry["type"], "model");
++            assert!(entry["created_at"].as_str().is_some());
++            assert!(entry.get("capabilities").is_some());
++            assert!(entry.get("max_input_tokens").is_some());
++            assert!(entry.get("max_tokens").is_some());
++        }
 +        for id in ["gpt-future-test", "claude-gpt-future-test"] {
 +            let entry = body["data"]
 +                .as_array()
@@ -781,6 +830,14 @@ index 0000000..6241acd
 +            assert_eq!(entry["display_name"], "GPT Future");
 +            assert_eq!(entry["description"], "Future model");
 +            assert_eq!(entry["default_reasoning_effort"], "ultra");
++            assert_eq!(entry["capabilities"]["effort"]["supported"], true);
++            assert_eq!(entry["capabilities"]["effort"]["low"]["supported"], true);
++            assert_eq!(entry["capabilities"]["effort"]["high"]["supported"], false);
++            assert_eq!(entry["capabilities"]["effort"]["max"]["supported"], false);
++            assert_eq!(entry["capabilities"]["image_input"]["supported"], true);
++            assert_eq!(entry["max_input_tokens"], 400000);
++            assert_eq!(entry["max_tokens"], Value::Null);
++            assert_eq!(entry["created_at"], "1970-01-01T00:00:00Z");
 +            assert_eq!(
 +                entry["supported_reasoning_efforts"][2]["effort"],
 +                "future_effort"
@@ -866,6 +923,10 @@ index 0000000..6241acd
 +            .unwrap();
 +        assert_eq!(legacy.resolve_effort(None).unwrap(), None);
 +        assert_eq!(
++            legacy.listing("gpt-legacy", false)["capabilities"],
++            Value::Null
++        );
++        assert_eq!(
 +            legacy.resolve_effort(Some("high")).unwrap(),
 +            Some("high".into())
 +        );
@@ -881,6 +942,10 @@ index 0000000..6241acd
 +            .find(|entry| entry.slug == "gpt-no-reasoning")
 +            .unwrap();
 +        assert_eq!(disabled.resolve_effort(None).unwrap(), None);
++        assert_eq!(
++            disabled.listing("gpt-no-reasoning", false)["capabilities"]["effort"]["supported"],
++            false
++        );
 +        assert!(disabled.resolve_effort(Some("high")).is_err());
 +        assert!(disabled.resolve_effort(Some("")).is_err());
 +        assert_eq!(
@@ -1540,7 +1605,7 @@ index 77a9cf6..4e6897c 100644
  
      #[test]
 diff --git a/src/server.rs b/src/server.rs
-index bb563d9..8df5fa5 100644
+index bb563d9..ed743de 100644
 --- a/src/server.rs
 +++ b/src/server.rs
 @@ -34,7 +34,7 @@ use axum::{
@@ -1575,7 +1640,7 @@ index bb563d9..8df5fa5 100644
  /// Anthropic-shaped model listing so Claude Code's gateway model discovery
  /// (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) finds the proxy's models.
  /// Claude Code only adds entries whose id starts with `claude` or `anthropic`,
-@@ -318,20 +334,34 @@ struct ModelsQuery {
+@@ -318,20 +334,36 @@ struct ModelsQuery {
  async fn handler_models(
      State(state): State<Arc<AppState>>,
      Query(query): Query<ModelsQuery>,
@@ -1604,6 +1669,8 @@ index bb563d9..8df5fa5 100644
 +                    json!({
 +                        "type": "model", "object": "model", "id": &model,
 +                        "display_name": format!("{model} ({provider})"),
++                        "created_at": "1970-01-01T00:00:00Z",
++                        "capabilities": null, "max_input_tokens": null, "max_tokens": null,
 +                    })
 +                });
 +            let compatibility_alias = (provider == "codex" && model.starts_with("gpt-"))
@@ -1618,7 +1685,7 @@ index bb563d9..8df5fa5 100644
      let has_more = query.limit.is_some_and(|limit| data.len() > limit);
      if let Some(limit) = query.limit {
          data.truncate(limit);
-@@ -343,6 +373,7 @@ async fn handler_models(
+@@ -343,6 +375,7 @@ async fn handler_models(
          "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
          "last_id": data.last().and_then(|entry| entry.get("id")).cloned(),
      }))
@@ -1626,7 +1693,7 @@ index bb563d9..8df5fa5 100644
  }
  
  async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
-@@ -892,6 +923,13 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
+@@ -892,6 +925,13 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
      let affinity = session_state
          .as_ref()
          .and_then(|session| session.affinity_provider.as_ref());
@@ -1640,7 +1707,7 @@ index bb563d9..8df5fa5 100644
      let Some(provider) = state
          .registry
          .provider_for_model(&normalized_model, affinity)
-@@ -1124,6 +1162,13 @@ async fn handler_chat_completions(
+@@ -1124,6 +1164,13 @@ async fn handler_chat_completions(
      let affinity = session_state
          .as_ref()
          .and_then(|session| session.affinity_provider.as_ref());
@@ -1654,7 +1721,7 @@ index bb563d9..8df5fa5 100644
      let Some(provider) = state
          .registry
          .provider_for_model(&normalized_model, affinity)
-@@ -1561,6 +1606,13 @@ async fn dispatch_request(
+@@ -1561,6 +1608,13 @@ async fn dispatch_request(
      let session_affinity = session_state
          .as_ref()
          .and_then(|state| state.affinity_provider.as_ref());
@@ -1668,7 +1735,7 @@ index bb563d9..8df5fa5 100644
      let original_provider = state
          .registry
          .provider_for_model(&normalized_model, session_affinity);
-@@ -2276,3 +2328,41 @@ mod auto_review_tests {
+@@ -2276,3 +2330,41 @@ mod auto_review_tests {
          assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-sol"));
      }
  }

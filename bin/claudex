@@ -130,6 +130,51 @@ EOF
 session_settings="$(printf '%s' \
   "{\"enableWorkflows\":true,\"modelPicker\":{\"replaceBuiltInOptions\":true,\"options\":[$model_options]},\"env\":{\"ANTHROPIC_BASE_URL\":\"$base_url\",\"ANTHROPIC_AUTH_TOKEN\":\"unused\",\"ANTHROPIC_MODEL\":\"$startup_model\",\"CLAUDE_CODE_AUTO_COMPACT_WINDOW\":\"272000\",\"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY\":\"0\",\"CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK\":\"1\",\"CLAUDE_CODE_WORKFLOWS\":\"1\"}}")"
 
+# Claude accepts only the last --settings value. Preserve SDK settings in the
+# same object, with Claudex's connection and model configuration taking priority.
+settings_members() {
+  awk '{ value = value $0 "\n" } END {
+    sub(/^[[:space:]]*/, "", value)
+    sub(/[[:space:]]*$/, "", value)
+    if (substr(value, 1, 1) != "{" || substr(value, length(value), 1) != "}") exit 1
+    print substr(value, 2, length(value) - 2)
+  }'
+}
+caller_settings=""
+remaining=$#
+literal_args=false
+while [ "$remaining" -gt 0 ]; do
+  arg=$1
+  shift
+  remaining=$((remaining - 1))
+  if [ "$literal_args" = true ]; then
+    set -- "$@" "$arg"
+    continue
+  fi
+  case "$arg" in
+    --) literal_args=true; set -- "$@" "$arg"; continue ;;
+    --settings)
+      [ "$remaining" -gt 0 ] || { echo "claudex: --settings requires a value" >&2; exit 1; }
+      value=$1
+      shift
+      remaining=$((remaining - 1))
+      ;;
+    --settings=*) value=${arg#--settings=} ;;
+    *) set -- "$@" "$arg"; continue ;;
+  esac
+  if [ -f "$value" ]; then
+    value="$(cat "$value")"
+  fi
+  members="$(printf '%s' "$value" | settings_members)" || {
+    echo "claudex: --settings must be a JSON object or a settings file" >&2
+    exit 1
+  }
+  if [ -n "$(printf '%s' "$members" | tr -d '[:space:]')" ]; then
+    caller_settings="$caller_settings$members,"
+  fi
+done
+session_settings="{$caller_settings$(printf '%s' "$session_settings" | settings_members)}"
+
 # An empty API key still counts as configured in recent Claude Code versions.
 unset ANTHROPIC_API_KEY
 

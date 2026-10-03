@@ -77,6 +77,14 @@ verbosity support, service tiers, and upgrade information when supplied by Codex
 Both raw GPT IDs and `claude-` compatibility IDs carry the same metadata.
 Missing fields remain absent; the proxy does not invent model capabilities.
 
+The listing also exposes Claude's Models API `capabilities.effort` shape, with
+support flags for `low`, `medium`, `high`, `xhigh`, and `max`, derived from the
+Codex catalog. If effort metadata is absent, capabilities remain null.
+GPT-specific levels remain in the Codex reasoning fields. Unknown release dates
+use Claude's permitted epoch value; unknown output limits remain null. Claude SDK initialization returns
+`supportsEffort` and `supportedEffortLevels`. SDK-supplied `--settings` are
+combined with Claudex's settings so they cannot remove its GPT model definitions.
+
 Reasoning options are exposed as `supported_reasoning_levels` and
 `supported_reasoning_efforts`; defaults are exposed as `default_reasoning_level`
 and `default_reasoning_effort`. Messages requests use `output_config.effort`,
