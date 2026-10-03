@@ -51,12 +51,18 @@ it does not create or switch to a separate Claude configuration directory.
 
 ## Models
 
-GPT-6 Astra is the default. The picker also includes every non-fast Codex GPT
-model advertised by the installed proxy, including the GPT-5.x families.
+The proxy discovers GPT models directly from the authenticated Codex catalog.
+The picker includes its visible non-fast GPT models. Your saved selection is
+preserved while it remains available; otherwise Codex's highest-priority visible
+model becomes the default.
 
 Use `/model` inside Claude Code to switch models and `/effort` to choose the
-reasoning effort. Claudex builds the picker from the proxy's live model list,
-so models added by future proxy updates appear without launcher changes.
+reasoning effort. Each launch refreshes the catalog; request validation and
+Responses Lite routing use the same catalog. New models appear without editing
+a model list or updating the proxy. No other app installation or model cache is
+used. OpenAI's public Codex release metadata supplies the protocol version
+required by the catalog. Discovery errors are reported instead of substituting
+a fixed model list. Restart Claudex to refresh an already-open picker.
 
 ## Ultracode workflows
 

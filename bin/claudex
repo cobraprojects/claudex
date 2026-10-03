@@ -41,10 +41,10 @@ if ! proxy_ready; then
   done
 fi
 
-models="$(curl -fsS --max-time 3 "$base_url/v1/models?limit=1000")"
+models="$(curl -fsS --max-time 75 "$base_url/v1/models?limit=1000")"
 model_ids="$(printf '%s\n' "$models" \
   | tr '{' '\n' \
-  | sed -n 's/.*"id":"\(claude-gpt-[a-z0-9.-]*\)".*/\1/p' \
+  | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\(claude-gpt-[A-Za-z0-9._-]*\)".*/\1/p' \
   | sed '/-fast$/d' \
   | sort -u)"
 [ -n "$model_ids" ] || {
@@ -72,12 +72,13 @@ if [ -n "$saved_model" ] \
   && printf '%s\n' "$model_ids" | grep -Fxq "$saved_model"; then
   startup_model="$saved_model"
 else
-  startup_model="claude-gpt-6-astra"
+  startup_model="$(printf '%s\n' "$models" \
+    | tr '{' '\n' \
+    | sed -n '/"is_default"[[:space:]]*:[[:space:]]*true/s/.*"id"[[:space:]]*:[[:space:]]*"\(claude-gpt-[A-Za-z0-9._-]*\)".*/\1/p' \
+    | head -n 1)"
   if ! printf '%s\n' "$model_ids" | grep -Fxq "$startup_model"; then
-    startup_model="claude-gpt-5.6-sol"
-  fi
-  if ! printf '%s\n' "$model_ids" | grep -Fxq "$startup_model"; then
-    startup_model="$(printf '%s\n' "$model_ids" | tail -n 1)"
+    echo "claudex: the proxy did not advertise a default Codex GPT model" >&2
+    exit 1
   fi
 fi
 

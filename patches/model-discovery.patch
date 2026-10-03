@@ -1,48 +1,846 @@
+diff --git a/src/providers/codex/chat_completions/request.rs b/src/providers/codex/chat_completions/request.rs
+index eeb2062..38f0884 100644
+--- a/src/providers/codex/chat_completions/request.rs
++++ b/src/providers/codex/chat_completions/request.rs
+@@ -2,9 +2,7 @@ use http::StatusCode;
+ use serde_json::{Map, Value, json};
+ 
+ use crate::providers::codex::translate::{
+-    model_allowlist::{
+-        ALLOWED_MODELS, assert_allowed_model, resolve_model_request, uses_responses_lite,
+-    },
++    model_allowlist::{assert_allowed_model, resolve_model_request, uses_responses_lite},
+     request::{Effort, resolve_effort_override, to_codex_effort},
+ };
+ use crate::{config, registry::normalize_incoming_model};
+@@ -55,7 +53,7 @@ fn translate_request_with_override(
+             format!(
+                 "Model '{requested_model}' resolves to unsupported model '{}'. Supported: {}",
+                 error.model,
+-                ALLOWED_MODELS.join(", ")
++                crate::providers::codex::models::advertised_models().join(", ")
+             ),
+             Some("model"),
+             Some("model_not_supported"),
+diff --git a/src/providers/codex/mod.rs b/src/providers/codex/mod.rs
+index c09f930..47dc969 100644
+--- a/src/providers/codex/mod.rs
++++ b/src/providers/codex/mod.rs
+@@ -6,6 +6,7 @@ pub mod continuation;
+ pub mod count_tokens;
+ pub(crate) mod events;
+ pub mod images;
++pub mod models;
+ pub mod native;
+ pub mod request_summary;
+ pub mod search;
+@@ -29,7 +30,6 @@ use crate::config;
+ use crate::logging::create_logger;
+ use crate::monitor::usage_from_anthropic_sse;
+ use crate::provider::{CliHandlers, Provider, RequestContext};
+-use crate::registry;
+ use crate::request_identity::ConversationIdentity;
+ use crate::retry::{compute_backoff_delay, sleep};
+ 
+@@ -99,7 +99,8 @@ impl CodexProvider {
+     ) -> Response {
+         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+         let want_stream = body.stream;
+-        let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
++        let default_model = models::default_model();
++        let model = body.model.as_deref().unwrap_or(&default_model);
+ 
+         let mut resolved =
+             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
+@@ -517,16 +518,7 @@ impl Provider for CodexProvider {
+     }
+ 
+     fn supported_models(&self) -> Vec<String> {
+-        let mut models: Vec<String> = registry::CODEX_MODELS
+-            .iter()
+-            .map(|m| m.to_string())
+-            .collect();
+-        for m in registry::CODEX_MODELS {
+-            models.push(format!("{m}-fast"));
+-        }
+-        models.sort_unstable();
+-        models.dedup();
+-        models
++        models::advertised_models()
+     }
+ 
+     fn cli(&self) -> &'static dyn CliHandlers {
+@@ -548,7 +540,8 @@ impl Provider for CodexProvider {
+     }
+ 
+     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+-        let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
++        let default_model = models::default_model();
++        let model = body.model.as_deref().unwrap_or(&default_model);
+         let mut resolved =
+             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
+         if let Err(e) = assert_allowed_model(&resolved.model) {
+diff --git a/src/providers/codex/models.rs b/src/providers/codex/models.rs
+new file mode 100644
+index 0000000..c03e715
+--- /dev/null
++++ b/src/providers/codex/models.rs
+@@ -0,0 +1,379 @@
++//! The authenticated Codex catalog is the source of model IDs and lane metadata.
++use std::sync::{LazyLock, RwLock};
++use std::time::{Duration, Instant};
++
++use anyhow::{Result, ensure};
++use serde::Deserialize;
++use tokio::sync::Mutex;
++
++use super::auth::{
++    constants::CODEX_API_ENDPOINT,
++    manager::CodexAuthManager,
++    token_store::{StoredAuth, file_store},
++};
++
++#[derive(Clone, Debug, Deserialize)]
++pub struct Model {
++    pub slug: String,
++    #[serde(default)]
++    pub priority: i32,
++    #[serde(default)]
++    pub use_responses_lite: bool,
++    pub visibility: String,
++}
++
++#[derive(Default, Deserialize)]
++struct Catalog {
++    models: Vec<Model>,
++}
++
++impl Catalog {
++    fn parse(body: &str) -> Result<Self> {
++        let mut catalog: Self = serde_json::from_str(body)?;
++        catalog.models.retain(|model| {
++            model.slug.starts_with("gpt-")
++                && model
++                    .slug
++                    .bytes()
++                    .all(|c| c.is_ascii_alphanumeric() || b".-_".contains(&c))
++        });
++        catalog
++            .models
++            .sort_by(|a, b| a.priority.cmp(&b.priority).then(a.slug.cmp(&b.slug)));
++        catalog.models.dedup_by(|a, b| a.slug == b.slug);
++        ensure!(
++            catalog
++                .models
++                .iter()
++                .any(|model| model.visibility == "list"),
++            "Codex did not return any visible GPT models"
++        );
++        Ok(catalog)
++    }
++
++    fn default_model(&self) -> Option<&str> {
++        self.models
++            .iter()
++            .find(|model| model.visibility == "list")
++            .map(|model| model.slug.as_str())
++    }
++}
++
++struct CachedCatalog {
++    access: String,
++    fetched_at: Instant,
++    catalog: Catalog,
++}
++
++static CATALOG: LazyLock<RwLock<Option<CachedCatalog>>> = LazyLock::new(|| RwLock::new(None));
++static REFRESH: Mutex<()> = Mutex::const_new(());
++
++pub async fn refresh(force: bool) -> Result<()> {
++    let _guard = REFRESH.lock().await;
++    let manager = CodexAuthManager::new(file_store());
++    let mut auth = match manager.get_auth().await {
++        Ok(auth) => auth,
++        Err(error) => {
++            *CATALOG.write().unwrap() = None;
++            return Err(error);
++        }
++    };
++    {
++        let cache = CATALOG.read().unwrap();
++        if !force
++            && cache.as_ref().is_some_and(|cache| {
++                cache.access == auth.access && cache.fetched_at.elapsed() < Duration::from_secs(300)
++            })
++        {
++            return Ok(());
++        }
++    }
++    // Drop the old account's catalog before fetching; replace same-account catalogs atomically.
++    {
++        let mut cache = CATALOG.write().unwrap();
++        if cache
++            .as_ref()
++            .is_some_and(|cache| cache.access != auth.access)
++        {
++            *cache = None;
++        }
++    }
++    let client = reqwest::Client::builder()
++        .timeout(Duration::from_secs(30))
++        .build()?;
++    let base = crate::config::codex_base_url(CODEX_API_ENDPOINT);
++    let endpoint = format!(
++        "{}/models",
++        base.trim_end_matches('/').trim_end_matches("/responses")
++    );
++    let version = protocol_version(&client).await?;
++    let mut response = fetch(&client, &endpoint, &auth, &version).await?;
++    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
++        auth = manager.force_refresh(&auth.access).await?;
++        response = fetch(&client, &endpoint, &auth, &version).await?;
++    }
++    let catalog = Catalog::parse(&response.error_for_status()?.text().await?)?;
++    *CATALOG.write().unwrap() = Some(CachedCatalog {
++        access: auth.access,
++        fetched_at: Instant::now(),
++        catalog,
++    });
++    Ok(())
++}
++
++// The catalog filters by Codex protocol version, not this proxy's package version.
++// Read OpenAI's published release metadata; no local Codex installation is used.
++async fn protocol_version(client: &reqwest::Client) -> Result<String> {
++    #[derive(Deserialize)]
++    struct Release {
++        tag_name: String,
++    }
++    let release: Release = client
++        .get("https://api.github.com/repos/openai/codex/releases/latest")
++        .header("User-Agent", "claudex")
++        .send()
++        .await?
++        .error_for_status()?
++        .json()
++        .await?;
++    let version = release
++        .tag_name
++        .strip_prefix("rust-v")
++        .ok_or_else(|| anyhow::anyhow!("Invalid OpenAI Codex release version"))?;
++    ensure!(
++        version.split('.').count() == 3
++            && version
++                .split('.')
++                .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit())),
++        "Invalid OpenAI Codex release version"
++    );
++    Ok(version.to_owned())
++}
++
++async fn fetch(
++    client: &reqwest::Client,
++    endpoint: &str,
++    auth: &StoredAuth,
++    version: &str,
++) -> Result<reqwest::Response> {
++    let mut request = client
++        .get(endpoint)
++        .query(&[("client_version", version)])
++        .bearer_auth(&auth.access)
++        .header("originator", "codex_cli_rs")
++        .header(
++            "User-Agent",
++            format!("claudex/{}", env!("CARGO_PKG_VERSION")),
++        );
++    if let Some(account) = &auth.account_id {
++        request = request.header("ChatGPT-Account-Id", account);
++    }
++    Ok(request.send().await?)
++}
++
++pub fn advertised_models() -> Vec<String> {
++    CATALOG
++        .read()
++        .unwrap()
++        .as_ref()
++        .map(|cache| {
++            cache
++                .catalog
++                .models
++                .iter()
++                .filter(|model| model.visibility == "list")
++                .map(|model| model.slug.clone())
++                .collect()
++        })
++        .unwrap_or_default()
++}
++
++pub fn contains(model: &str) -> bool {
++    CATALOG
++        .read()
++        .unwrap()
++        .as_ref()
++        .is_some_and(|cache| cache.catalog.models.iter().any(|entry| entry.slug == model))
++}
++
++pub fn uses_responses_lite(model: &str) -> bool {
++    CATALOG.read().unwrap().as_ref().is_some_and(|cache| {
++        cache
++            .catalog
++            .models
++            .iter()
++            .any(|entry| entry.slug == model && entry.use_responses_lite)
++    })
++}
++
++pub fn default_model() -> String {
++    CATALOG
++        .read()
++        .unwrap()
++        .as_ref()
++        .and_then(|cache| cache.catalog.default_model().map(str::to_owned))
++        .unwrap_or_default()
++}
++
++pub fn full_lane_model(model: &str) -> String {
++    let cache = CATALOG.read().unwrap();
++    let Some(cache) = cache.as_ref() else {
++        return model.to_owned();
++    };
++    if cache
++        .catalog
++        .models
++        .iter()
++        .any(|entry| entry.slug == model && entry.use_responses_lite)
++    {
++        if let Some(entry) = cache
++            .catalog
++            .models
++            .iter()
++            .find(|entry| entry.visibility == "list" && !entry.use_responses_lite)
++        {
++            return entry.slug.clone();
++        }
++    }
++    model.to_owned()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use axum::{Json, Router, routing::get};
++    use serde_json::json;
++
++    #[tokio::test]
++    async fn discovery_catalog_routes_future_models_and_replaces_removed_models() {
++        let body = json!({"models": [
++            {"slug": "gpt-future-test", "visibility": "list", "priority": 0, "use_responses_lite": true},
++            {"slug": "gpt-full-test", "visibility": "list", "priority": 1},
++            {"slug": "gpt-hidden-test", "visibility": "hide", "priority": -1}
++        ]});
++        let app = Router::new().route(
++            "/models",
++            get(move |headers: http::HeaderMap| {
++                let body = body.clone();
++                async move {
++                    assert_eq!(headers["authorization"], "Bearer test-token");
++                    assert_eq!(headers["chatgpt-account-id"], "test-account");
++                    Json(body)
++                }
++            }),
++        );
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let endpoint = format!("http://{}/models", listener.local_addr().unwrap());
++        let server = tokio::spawn(async move {
++            axum::serve(listener, app).await.unwrap();
++        });
++        let auth = StoredAuth {
++            access: "test-token".into(),
++            refresh: String::new(),
++            expires: u64::MAX,
++            account_id: Some("test-account".into()),
++        };
++        let response = fetch(&reqwest::Client::new(), &endpoint, &auth, "0.1.0")
++            .await
++            .unwrap();
++        let catalog = Catalog::parse(&response.text().await.unwrap()).unwrap();
++        *CATALOG.write().unwrap() = Some(CachedCatalog {
++            access: auth.access,
++            fetched_at: Instant::now(),
++            catalog,
++        });
++        let registry = crate::registry::Registry::new(crate::config::AliasProvider::Codex);
++        let translated = super::super::chat_completions::request::translate_request(json!({
++            "model": "gpt-future-test", "messages": [{"role": "user", "content": "hello"}]
++        }))
++        .unwrap();
++        assert_eq!(translated.model, "gpt-future-test");
++        assert!(translated.use_responses_lite);
++        assert!(
++            super::super::native::validate_native_request_model(&json!({
++                "model": "gpt-future-test", "input": "hello"
++            }))
++            .is_ok()
++        );
++        let provider: std::sync::Arc<dyn crate::provider::Provider> =
++            std::sync::Arc::new(super::super::CodexProvider::new());
++        let fixture_registry = crate::registry::Registry::from_providers(
++            crate::config::AliasProvider::Codex,
++            [provider],
++        );
++        use http_body_util::BodyExt;
++        use tower::ServiceExt;
++        let response = crate::server::app(std::sync::Arc::new(fixture_registry))
++            .oneshot(
++                http::Request::builder()
++                    .uri("/v1/models")
++                    .body(axum::body::Body::empty())
++                    .unwrap(),
++            )
++            .await
++            .unwrap();
++        assert_eq!(response.status(), http::StatusCode::OK);
++        let body: serde_json::Value =
++            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
++                .unwrap();
++        assert!(body["data"].as_array().unwrap().iter().any(|entry|
++            entry["id"] == "claude-gpt-future-test" && entry["is_default"] == true));
++
++        assert_eq!(default_model(), "gpt-future-test");
++        assert_eq!(advertised_models(), ["gpt-future-test", "gpt-full-test"]);
++        assert!(
++            super::super::translate::model_allowlist::assert_allowed_model("gpt-future-test")
++                .is_ok()
++        );
++        assert!(uses_responses_lite("gpt-future-test"));
++        assert!(!uses_responses_lite("gpt-full-test"));
++        assert_eq!(full_lane_model("gpt-future-test"), "gpt-full-test");
++        assert_eq!(
++            registry
++                .provider_for_model("claude-gpt-future-test", None)
++                .unwrap()
++                .name(),
++            "codex"
++        );
++        assert!(
++            registry
++                .all_supported_models()
++                .contains(&("gpt-future-test".into(), "codex".into()))
++        );
++        let catalog =
++            Catalog::parse(r#"{"models":[{"slug":"gpt-next-test","visibility":"list"}]}"#).unwrap();
++        CATALOG.write().unwrap().as_mut().unwrap().catalog = catalog;
++        assert_eq!(
++            registry
++                .supported_models_for("codex")
++                .iter()
++                .filter(|id| id.starts_with("gpt-"))
++                .collect::<Vec<_>>(),
++            [&"gpt-next-test".to_string()]
++        );
++        assert!(!contains("gpt-future-test"));
++        assert!(
++            super::super::translate::model_allowlist::assert_allowed_model("gpt-future-test")
++                .is_err()
++        );
++        assert!(
++            registry
++                .provider_for_model("gpt-future-test", None)
++                .is_none()
++        );
++        *CATALOG.write().unwrap() = None;
++        server.abort();
++    }
++
++    #[test]
++    fn discovery_rejects_invalid_and_empty_catalogs() {
++        for body in [
++            r#"{"models":[]}"#,
++            r#"{"models":[{"slug":"gpt-bad\"","visibility":"list"}]}"#,
++            r#"{"models":[{"slug":"gpt-hidden","visibility":"hide"}]}"#,
++            r#"{"data":[]}"#,
++        ] {
++            assert!(Catalog::parse(body).is_err());
++        }
++    }
++}
+diff --git a/src/providers/codex/native.rs b/src/providers/codex/native.rs
+index 63995b9..600b9c5 100644
+--- a/src/providers/codex/native.rs
++++ b/src/providers/codex/native.rs
+@@ -19,8 +19,7 @@ use crate::traffic::{
+ 
+ use super::client::{CodexError, CodexHttpClient};
+ use super::translate::model_allowlist::{
+-    ALLOWED_MODELS, MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model,
+-    uses_responses_lite,
++    assert_allowed_model, full_lane_web_search_model, uses_responses_lite,
+ };
+ 
+ pub struct CodexNativeBackend {
+@@ -102,7 +101,7 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
+             format!(
+                 "Model '{requested}' resolves to unsupported model '{}'. Supported: {}",
+                 error.model,
+-                ALLOWED_MODELS.join(", ")
++                super::models::advertised_models().join(", ")
+             ),
+             Some("model"),
+             Some("model_not_supported"),
+@@ -141,15 +140,15 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
+ 
+ fn resolve_native_model(requested: &str) -> (String, bool) {
+     let (requested, priority) = match requested.strip_suffix("-fast") {
+-        Some(base) if ALLOWED_MODELS.contains(&base) => (base, true),
++        Some(base) if super::models::contains(base) => (base, true),
+         _ => (requested, false),
+     };
+-    let model = MODEL_ALIASES
+-        .iter()
+-        .find(|(alias, _)| *alias == requested)
+-        .map(|(_, target)| *target)
+-        .unwrap_or(requested);
+-    (model.to_string(), priority)
++    let model = if crate::registry::is_anthropic_alias(requested) {
++        super::models::default_model()
++    } else {
++        requested.to_string()
++    };
++    (model, priority)
+ }
+ 
+ fn has_native_hosted_web_search(object: &Map<String, Value>) -> bool {
 diff --git a/src/providers/codex/translate/model_allowlist.rs b/src/providers/codex/translate/model_allowlist.rs
-index bb4c062..086063f 100644
+index bb4c062..aa8e078 100644
 --- a/src/providers/codex/translate/model_allowlist.rs
 +++ b/src/providers/codex/translate/model_allowlist.rs
-@@ -14,6 +14,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
-     "gpt-5.6-luna",
-     "gpt-5.6-sol",
-     "gpt-5.6-terra",
-+    "gpt-6-astra",
- ];
+@@ -1,59 +1,27 @@
+-use std::collections::HashSet;
+-
+ use crate::config;
++use crate::providers::codex::models;
  
- pub const MODEL_ALIASES: &[(&str, &str)] = &[
-@@ -117,7 +118,10 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
+ use super::request::ServiceTier;
+ 
+-pub const ALLOWED_MODELS: &[&str] = &[
+-    "gpt-5.2",
+-    "gpt-5.3-codex",
+-    "gpt-5.3-codex-spark",
+-    "gpt-5.4",
+-    "gpt-5.4-mini",
+-    "gpt-5.5",
+-    "gpt-5.6-luna",
+-    "gpt-5.6-sol",
+-    "gpt-5.6-terra",
+-];
+-
+-pub const MODEL_ALIASES: &[(&str, &str)] = &[
+-    ("haiku", "gpt-5.6-luna"),
+-    ("claude-haiku-4-5", "gpt-5.6-luna"),
+-    ("claude-haiku-4-5-20251001", "gpt-5.6-luna"),
+-    ("sonnet", "gpt-5.6-terra"),
+-    ("claude-sonnet-4-6", "gpt-5.6-terra"),
+-    ("claude-sonnet-5", "gpt-5.6-terra"),
+-    ("opus", "gpt-5.6-sol"),
+-    ("claude-opus-4-7", "gpt-5.6-sol"),
+-    ("claude-opus-4-8", "gpt-5.6-sol"),
+-    ("claude-opus-5", "gpt-5.6-sol"),
+-    ("fable", "gpt-5.6-sol"),
+-    ("claude-fable-5", "gpt-5.6-sol"),
+-];
+-
+ #[derive(Debug, Clone)]
+ pub struct ResolvedModel {
+     pub model: String,
+     pub service_tier: Option<ServiceTier>,
+ }
+ 
+-fn fast_model_aliases() -> HashSet<String> {
+-    ALLOWED_MODELS.iter().map(|m| format!("{m}-fast")).collect()
+-}
+-
+ fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
+-    let fast_set = fast_model_aliases();
+-    if fast_set.contains(model) {
+-        let base = model.trim_end_matches("-fast");
+-        ResolvedModel {
+-            model: base.to_string(),
++    match model
++        .strip_suffix("-fast")
++        .filter(|base| models::contains(base))
++    {
++        Some(base) => ResolvedModel {
++            model: base.to_owned(),
+             service_tier: Some(ServiceTier::Priority),
+-        }
+-    } else {
+-        ResolvedModel {
+-            model: model.to_string(),
++        },
++        None => ResolvedModel {
++            model: model.to_owned(),
+             service_tier: None,
+-        }
++        },
+     }
+ }
+ 
+@@ -65,11 +33,12 @@ pub fn resolve_model_request_with_config_override(
+     model: &str,
+     apply_config_override: bool,
+ ) -> ResolvedModel {
+-    let alias = MODEL_ALIASES
+-        .iter()
+-        .find(|(alias, _)| *alias == model)
+-        .map(|(_, target)| *target)
+-        .unwrap_or(model);
++    let default_model = models::default_model();
++    let alias = if crate::registry::is_anthropic_alias(model) {
++        &default_model
++    } else {
++        model
++    };
+ 
+     let requested = resolve_fast_model_alias(alias);
+ 
+@@ -107,7 +76,7 @@ impl std::fmt::Display for ModelNotAllowedError {
+ }
+ 
+ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
+-    if ALLOWED_MODELS.contains(&model) {
++    if models::contains(model) {
+         Ok(())
+     } else {
+         Err(ModelNotAllowedError {
+@@ -117,101 +86,15 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
  }
  
  pub fn uses_responses_lite(model: &str) -> bool {
 -    matches!(model, "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra")
-+    matches!(
-+        model,
-+        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
-+    )
++    models::uses_responses_lite(model)
  }
  
- /// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
-@@ -207,6 +211,7 @@ mod tests {
-         assert!(assert_allowed_model("gpt-5.4").is_ok());
-         assert!(assert_allowed_model("gpt-5.6-sol").is_ok());
-         assert!(assert_allowed_model("gpt-5.6-terra").is_ok());
-+        assert!(assert_allowed_model("gpt-6-astra").is_ok());
-         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
-     }
+-/// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
+-/// Responses API resolves it to a `-free` variant and returns 404 (Model not
+-/// found gpt-5.6-luna-free-...). Hosted web_search requests must run on the
+-/// full lane, so luna is upgraded to its nearest full-lane sibling.
+-pub fn full_lane_web_search_model(model: &str) -> &str {
+-    if model == "gpt-5.6-luna" {
+-        "gpt-5.6-sol"
+-    } else {
+-        model
+-    }
++pub fn full_lane_web_search_model(model: &str) -> String {
++    models::full_lane_model(model)
+ }
  
+ pub fn is_valid_model_for_codex(model: &str) -> bool {
+-    if ALLOWED_MODELS.contains(&model) {
+-        return true;
+-    }
+-    let fast_set = fast_model_aliases();
+-    if fast_set.contains(model) {
+-        return true;
+-    }
+-    MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn haiku_resolves_to_luna() {
+-        let r = resolve_model_request("haiku");
+-        assert_eq!(r.model, "gpt-5.6-luna");
+-    }
+-
+-    #[test]
+-    fn web_search_upgrades_luna_to_full_lane_sibling() {
+-        assert_eq!(full_lane_web_search_model("gpt-5.6-luna"), "gpt-5.6-sol");
+-        assert_eq!(full_lane_web_search_model("gpt-5.6-sol"), "gpt-5.6-sol");
+-        assert_eq!(full_lane_web_search_model("gpt-5.6-terra"), "gpt-5.6-terra");
+-        assert_eq!(full_lane_web_search_model("gpt-5.4"), "gpt-5.4");
+-    }
+-
+-    #[test]
+-    fn sonnet_resolves_to_terra() {
+-        let r = resolve_model_request("sonnet");
+-        assert_eq!(r.model, "gpt-5.6-terra");
+-    }
+-
+-    #[test]
+-    fn sonnet_5_resolves_to_terra() {
+-        let r = resolve_model_request("claude-sonnet-5");
+-        assert_eq!(r.model, "gpt-5.6-terra");
+-    }
+-
+-    #[test]
+-    fn opus_resolves_to_sol() {
+-        let r = resolve_model_request("opus");
+-        assert_eq!(r.model, "gpt-5.6-sol");
+-    }
+-
+-    #[test]
+-    fn opus_aliases_resolve_to_sol() {
+-        for model in ["claude-opus-4-8", "claude-opus-5"] {
+-            let r = resolve_model_request(model);
+-            assert_eq!(r.model, "gpt-5.6-sol");
+-        }
+-    }
+-
+-    #[test]
+-    fn fable_5_resolves_to_sol() {
+-        for model in ["fable", "claude-fable-5"] {
+-            let r = resolve_model_request(model);
+-            assert_eq!(r.model, "gpt-5.6-sol");
+-        }
+-    }
+-
+-    #[test]
+-    fn fast_suffix_adds_priority() {
+-        let r = resolve_model_request("gpt-5.6-sol-fast");
+-        assert_eq!(r.model, "gpt-5.6-sol");
+-        assert_eq!(r.service_tier, Some(ServiceTier::Priority));
+-    }
+-
+-    #[test]
+-    fn allowed_models_accept_base() {
+-        assert!(assert_allowed_model("gpt-5.4").is_ok());
+-        assert!(assert_allowed_model("gpt-5.6-sol").is_ok());
+-        assert!(assert_allowed_model("gpt-5.6-terra").is_ok());
+-        assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
+-    }
+-
+-    #[test]
+-    fn not_allowed_rejected() {
+-        assert!(assert_allowed_model("gpt-7").is_err());
+-    }
++    models::contains(model)
++        || model.strip_suffix("-fast").is_some_and(models::contains)
++        || crate::registry::is_anthropic_alias(model)
+ }
 diff --git a/src/registry.rs b/src/registry.rs
-index 77a9cf6..012a1d6 100644
+index 77a9cf6..4e6897c 100644
 --- a/src/registry.rs
 +++ b/src/registry.rs
-@@ -46,6 +46,7 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
-     "gpt-5.6-luna",
-     "gpt-5.6-sol",
-     "gpt-5.6-terra",
-+    "gpt-6-astra",
+@@ -6,7 +6,7 @@ use crate::{
+ use anyhow::{Result, anyhow};
+ use async_trait::async_trait;
+ use axum::{http::StatusCode, response::Response};
+-use std::collections::{BTreeMap, HashSet};
++use std::collections::BTreeMap;
+ use std::sync::Arc;
+ 
+ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
+@@ -37,23 +37,12 @@ const CURSOR_LEGACY_MODELS: &[&str] = &[
+     "composer-2.5-fast",
  ];
  
+-pub(crate) const CODEX_MODELS: &[&str] = &[
+-    "gpt-5.2",
+-    "gpt-5.3-codex",
+-    "gpt-5.3-codex-spark",
+-    "gpt-5.4",
+-    "gpt-5.4-mini",
+-    "gpt-5.5",
+-    "gpt-5.6-luna",
+-    "gpt-5.6-sol",
+-    "gpt-5.6-terra",
+-];
+-
  pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
-@@ -198,10 +198,15 @@ impl Registry {
+ pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5", "grok-4.6"];
+ 
+ pub struct Registry {
+     alias_provider: AliasProvider,
++    discover_codex: bool,
+     models: BTreeMap<String, Vec<String>>,
+     handlers: BTreeMap<String, Arc<dyn Provider>>,
+ }
+@@ -61,7 +50,7 @@ pub struct Registry {
+ impl Registry {
+     pub fn new(alias_provider: AliasProvider) -> Self {
+         let mut models: BTreeMap<String, Vec<String>> = BTreeMap::new();
+-        models.insert("codex".into(), expand_codex_models());
++        models.insert("codex".into(), Vec::new());
+         models.insert(
+             "kimi".into(),
+             KIMI_MODELS.iter().map(|m| (*m).to_string()).collect(),
+@@ -94,6 +83,7 @@ impl Registry {
+ 
+         Self {
+             alias_provider,
++            discover_codex: true,
+             models,
+             handlers,
+         }
+@@ -116,11 +106,31 @@ impl Registry {
+         }
+         Self {
+             alias_provider,
++            discover_codex: false,
+             models,
+             handlers,
+         }
+     }
+ 
++    pub fn discovers_codex(&self) -> bool {
++        self.discover_codex
++    }
++
++    pub async fn refresh_codex_for_model(
++        &self,
++        model: &str,
++        affinity: Option<&AliasProvider>,
++    ) -> Result<()> {
++        if self.discover_codex
++            && (model.starts_with("gpt-")
++                || (is_anthropic_alias(model)
++                    && affinity.unwrap_or(&self.alias_provider) == &AliasProvider::Codex))
++        {
++            crate::providers::codex::models::refresh(false).await?;
++        }
++        Ok(())
++    }
++
+     pub fn list_provider_names(&self) -> Vec<String> {
+         let mut names: Vec<String> = self.handlers.keys().cloned().collect();
+         names.sort_unstable();
+@@ -132,7 +142,11 @@ impl Registry {
+     }
+ 
+     pub fn supported_models_for(&self, provider: &str) -> Vec<String> {
+-        let mut models = self.models.get(provider).cloned().unwrap_or_default();
++        let mut models = if provider == "codex" && self.discover_codex {
++            crate::providers::codex::models::advertised_models()
++        } else {
++            self.models.get(provider).cloned().unwrap_or_default()
++        };
+         if provider == self.alias_provider.as_str() {
+             for alias in ANTHROPIC_STYLE_ALIASES {
+                 if !models.iter().any(|value| value == alias) {
+@@ -176,8 +190,17 @@ impl Registry {
+             return self.handlers.get("cursor").cloned();
+         }
+ 
++        if self.discover_codex
++            && crate::providers::codex::translate::model_allowlist::is_valid_model_for_codex(
++                &normalized,
++            )
++        {
++            return self.handlers.get("codex").cloned();
++        }
+         for (name, models) in &self.models {
+-            if models.iter().any(|candidate| candidate == &normalized) {
++            if (name != "codex" || !self.discover_codex)
++                && models.iter().any(|candidate| candidate == &normalized)
++            {
+                 return self.handlers.get(name).cloned();
+             }
+         }
+@@ -198,10 +221,15 @@ impl Registry {
  
  pub fn normalize_incoming_model(model: &str) -> String {
      let suffix = "[1m]";
@@ -62,7 +860,30 @@ index 77a9cf6..012a1d6 100644
  }
  
  pub fn is_anthropic_alias(model: &str) -> bool {
-@@ -344,6 +349,14 @@ mod tests {
+@@ -311,22 +339,6 @@ const CODEX_CLI: PlaceholderCli = PlaceholderCli { provider: "codex" };
+ const KIMI_CLI: PlaceholderCli = PlaceholderCli { provider: "kimi" };
+ const CURSOR_CLI: PlaceholderCli = PlaceholderCli { provider: "cursor" };
+ const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
+-fn expand_codex_models() -> Vec<String> {
+-    let mut set = HashSet::new();
+-    let mut out = Vec::new();
+-    for model in CODEX_MODELS {
+-        if set.insert((*model).to_string()) {
+-            out.push((*model).to_string());
+-        }
+-        let fast = format!("{model}-fast");
+-        if set.insert(fast.clone()) {
+-            out.push(fast);
+-        }
+-    }
+-    out.sort_unstable();
+-    out
+-}
+-
+ fn build_cursor_models() -> Vec<String> {
+     let mut out: Vec<String> = CURSOR_LEGACY_MODELS
+         .iter()
+@@ -344,6 +356,14 @@ mod tests {
      fn normalize_model_trims_hint() {
          assert_eq!(normalize_incoming_model("gpt-5.4-fast[1m]"), "gpt-5.4-fast");
          assert_eq!(normalize_incoming_model("gpt-5.4-fast"), "gpt-5.4-fast");
@@ -78,10 +899,34 @@ index 77a9cf6..012a1d6 100644
  
      #[test]
 diff --git a/src/server.rs b/src/server.rs
-index bb563d9..1abc019 100644
+index bb563d9..9eb66d2 100644
 --- a/src/server.rs
 +++ b/src/server.rs
-@@ -323,15 +323,26 @@ async fn handler_models(
+@@ -34,7 +34,7 @@ use axum::{
+     body::Body,
+     extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State},
+     http::{Request, StatusCode},
+-    response::Response,
++    response::{IntoResponse, Response},
+     routing::{get, post},
+ };
+ use http_body_util::{BodyExt, StreamBody};
+@@ -318,20 +318,44 @@ struct ModelsQuery {
+ async fn handler_models(
+     State(state): State<Arc<AppState>>,
+     Query(query): Query<ModelsQuery>,
+-) -> Json<serde_json::Value> {
++) -> Response {
++    if state.registry.discovers_codex() {
++        if let Err(error) = crate::providers::codex::models::refresh(true).await {
++            return json_error(
++                StatusCode::BAD_GATEWAY,
++                "model_discovery_error",
++                error.to_string(),
++            );
++        }
++    }
+     let mut data: Vec<Value> = state
          .registry
          .all_supported_models()
          .into_iter()
@@ -109,6 +954,72 @@ index bb563d9..1abc019 100644
          })
          .collect();
 +    data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
++    let default_model = crate::providers::codex::models::default_model();
++    for entry in &mut data {
++        entry["is_default"] = json!(entry["id"] == format!("claude-{default_model}"));
++    }
      let has_more = query.limit.is_some_and(|limit| data.len() > limit);
      if let Some(limit) = query.limit {
          data.truncate(limit);
+@@ -343,6 +367,7 @@ async fn handler_models(
+         "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
+         "last_id": data.last().and_then(|entry| entry.get("id")).cloned(),
+     }))
++    .into_response()
+ }
+ 
+ async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+@@ -892,6 +917,17 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
+     let affinity = session_state
+         .as_ref()
+         .and_then(|session| session.affinity_provider.as_ref());
++    if let Err(error) = state
++        .registry
++        .refresh_codex_for_model(&normalized_model, affinity)
++        .await
++    {
++        return json_error(
++            StatusCode::BAD_GATEWAY,
++            "model_discovery_error",
++            error.to_string(),
++        );
++    }
+     let Some(provider) = state
+         .registry
+         .provider_for_model(&normalized_model, affinity)
+@@ -1124,6 +1160,17 @@ async fn handler_chat_completions(
+     let affinity = session_state
+         .as_ref()
+         .and_then(|session| session.affinity_provider.as_ref());
++    if let Err(error) = state
++        .registry
++        .refresh_codex_for_model(&normalized_model, affinity)
++        .await
++    {
++        return json_error(
++            StatusCode::BAD_GATEWAY,
++            "model_discovery_error",
++            error.to_string(),
++        );
++    }
+     let Some(provider) = state
+         .registry
+         .provider_for_model(&normalized_model, affinity)
+@@ -1561,6 +1608,17 @@ async fn dispatch_request(
+     let session_affinity = session_state
+         .as_ref()
+         .and_then(|state| state.affinity_provider.as_ref());
++    if let Err(error) = state
++        .registry
++        .refresh_codex_for_model(&normalized_model, session_affinity)
++        .await
++    {
++        return json_error(
++            StatusCode::BAD_GATEWAY,
++            "model_discovery_error",
++            error.to_string(),
++        );
++    }
+     let original_provider = state
+         .registry
+         .provider_for_model(&normalized_model, session_affinity);

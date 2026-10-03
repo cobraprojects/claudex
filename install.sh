@@ -151,14 +151,6 @@ until curl -fsS --max-time 2 "$base_url/healthz" >/dev/null 2>&1; do
   sleep 0.25
 done
 
-models="$(curl -fsS --max-time 3 "$base_url/v1/models?limit=1000")"
-for model in claude-gpt-5.4 claude-gpt-5.5 claude-gpt-5.6-luna claude-gpt-5.6-terra claude-gpt-5.6-sol claude-gpt-6-astra; do
-  case "$models" in
-    *"\"id\":\"$model\""*) ;;
-    *) fail "installed proxy did not advertise $model" ;;
-  esac
-done
-
 profile="$HOME/.profile"
 case "${SHELL:-}" in
   */zsh) profile="$HOME/.zshrc" ;;
@@ -197,6 +189,11 @@ else
   say "opening the ChatGPT/Codex login flow"
   "$proxy" codex auth login
 fi
+
+models="$(curl -fsS --max-time 75 "$base_url/v1/models?limit=1000")" \
+  || fail "could not discover models from Codex"
+printf '%s\n' "$models" | grep -q '"id":"claude-gpt-' \
+  || fail "Codex did not advertise any GPT models for this account"
 
 say "installed successfully"
 say "open a new terminal or run: export PATH=\"$HOME/.local/bin:\$PATH\""
