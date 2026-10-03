@@ -64,9 +64,30 @@ used. OpenAI's public Codex release metadata supplies the protocol version
 required by the catalog. Discovery errors are reported instead of substituting
 a fixed model list. Restart Claudex to refresh an already-open picker.
 
+The `/v1/models` response includes the catalog's display names and descriptions,
+supported reasoning levels with their descriptions, default effort, context and
+compaction limits, input modalities, image-detail support, reasoning-summary and
+verbosity support, service tiers, and upgrade information when supplied by Codex.
+Both raw GPT IDs and `claude-` compatibility IDs carry the same metadata.
+Missing fields remain absent; the proxy does not invent model capabilities.
+
+Reasoning options are exposed as `supported_reasoning_levels` and
+`supported_reasoning_efforts`; defaults are exposed as `default_reasoning_level`
+and `default_reasoning_effort`. Messages requests use `output_config.effort`,
+Chat Completions requests use `reasoning_effort`, and Responses requests use
+`reasoning.effort`. Omitted effort uses the catalog default. Unsupported levels
+return a local HTTP 400 error. Catalog-defined levels, including `minimal`,
+`ultra`, `persistent`, and future values, are forwarded without renaming them.
+If the catalog omits supported levels, validation is left to Codex.
+
+Other apps must read this metadata to offer the corresponding controls; model
+discovery alone cannot add an effort selector to their UI. Claude Code's
+`/effort` menu still follows its Fable compatibility profile and cannot expose
+every GPT-specific level.
+
 ## Ultracode workflows
 
-Every discovered GPT model uses Claude Code's Fable capability profile, which
+Every discovered GPT model uses Claude Code's `claude-fable-5-1` capability profile, which
 includes dynamic workflows. Run `/effort ultracode`, or include `ultracode` in a
 prompt, to enable the session-only mode. Ultracode is a workflow-orchestration
 mode, not a thinking level: it manages subagents through dynamic workflows and

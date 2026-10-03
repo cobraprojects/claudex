@@ -41,6 +41,7 @@ test('new catalog models appear and the service chooses the default', { concurre
   const settings = await launch(t, [model('gpt-z-old'), model('gpt-next_future', true), model('gpt-next_future-fast')]);
   assert.equal(settings.env.ANTHROPIC_MODEL, 'claude-gpt-next_future');
   assert.deepEqual(settings.modelPicker.options.map(option => option.model), ['claude-gpt-next_future', 'claude-gpt-z-old']);
+  assert.ok(settings.modelPicker.options.every(option => option.behavesAs === 'claude-fable-5-1'));
 });
 
 test('a saved available model stays selected', { concurrency: true }, async t => {
@@ -60,4 +61,23 @@ test('discovery failure stops launch instead of inventing models', { concurrency
 test('a missing default produces an explicit error', { concurrency: true }, async t => {
   await assert.rejects(launch(t, [model('gpt-new')]), error =>
     error.stderr.includes('did not advertise a default Codex GPT model'));
+});
+
+test('nested capability metadata preserves the default and model choices', { concurrency: true }, async t => {
+  const discovered = {
+    ...model('gpt-next', true),
+    display_name: 'GPT Next',
+    default_reasoning_effort: 'ultra',
+    supported_reasoning_efforts: [
+      { effort: 'low', description: 'Fast' },
+      { effort: 'ultra', description: 'Deep' },
+    ],
+    context_window: 400000,
+    input_modalities: ['text', 'image'],
+    service_tiers: [{ id: 'priority', name: 'Fast' }],
+    upgrade: { id: 'gpt-future' },
+  };
+  const settings = await launch(t, [discovered, model('gpt-other')]);
+  assert.equal(settings.env.ANTHROPIC_MODEL, 'claude-gpt-next');
+  assert.deepEqual(settings.modelPicker.options.map(option => option.model), ['claude-gpt-next', 'claude-gpt-other']);
 });

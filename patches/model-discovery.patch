@@ -1,5 +1,5 @@
 diff --git a/src/providers/codex/chat_completions/request.rs b/src/providers/codex/chat_completions/request.rs
-index eeb2062..38f0884 100644
+index eeb2062..3021bc6 100644
 --- a/src/providers/codex/chat_completions/request.rs
 +++ b/src/providers/codex/chat_completions/request.rs
 @@ -2,9 +2,7 @@ use http::StatusCode;
@@ -22,6 +22,60 @@ index eeb2062..38f0884 100644
              ),
              Some("model"),
              Some("model_not_supported"),
+@@ -93,7 +91,7 @@ fn translate_request_with_override(
+     }
+ 
+     let request_effort = match object.get("reasoning_effort") {
+-        None | Some(Value::Null) => Some(Effort::Medium),
++        None | Some(Value::Null) => None,
+         Some(Value::String(value)) => parse_effort(value)?,
+         Some(_) => {
+             return Err(ChatError::invalid(
+@@ -113,7 +111,18 @@ fn translate_request_with_override(
+         )
+     })?;
+ 
+-    let mut text = Map::from_iter([("verbosity".to_string(), json!("low"))]);
++    let effort_value = effort.as_ref().map(ToString::to_string);
++    let validated = super::super::models::resolve_effort(&resolved.model, effort_value.as_deref())
++        .map_err(|error| {
++            ChatError::invalid(
++                error.to_string(),
++                Some("reasoning_effort"),
++                Some("unsupported_value"),
++            )
++        })?;
++    let effort = to_codex_effort(validated.as_deref());
++
++    let mut text = Map::new();
+     if let Some(format) = translate_response_format(object.get("response_format"))? {
+         text.insert("format".to_string(), format);
+     }
+@@ -134,7 +143,7 @@ fn translate_request_with_override(
+         );
+     }
+     let mut reasoning = Map::from_iter([("context".to_string(), json!("all_turns"))]);
+-    if let Some(effort) = effort.as_ref().filter(|effort| **effort != Effort::None) {
++    if let Some(effort) = effort.as_ref() {
+         reasoning.insert("effort".to_string(), json!(effort));
+     }
+     upstream.insert("reasoning".to_string(), Value::Object(reasoning));
+@@ -292,14 +301,9 @@ fn translate_content(content: Option<&Value>, index: usize) -> Result<Vec<Value>
+ }
+ 
+ fn parse_effort(value: &str) -> Result<Option<Effort>, ChatError> {
+-    if value == "none" {
+-        return Ok(Some(Effort::None));
+-    }
+     to_codex_effort(Some(value)).map(Some).ok_or_else(|| {
+         ChatError::invalid(
+-            format!(
+-                "Invalid reasoning effort '{value}'. Supported: none, low, medium, high, xhigh, max"
+-            ),
++            "Reasoning effort must not be empty",
+             Some("reasoning_effort"),
+             Some("unsupported_value"),
+         )
 diff --git a/src/providers/codex/mod.rs b/src/providers/codex/mod.rs
 index c09f930..47dc969 100644
 --- a/src/providers/codex/mod.rs
@@ -82,16 +136,17 @@ index c09f930..47dc969 100644
          if let Err(e) = assert_allowed_model(&resolved.model) {
 diff --git a/src/providers/codex/models.rs b/src/providers/codex/models.rs
 new file mode 100644
-index 0000000..c03e715
+index 0000000..70cd51d
 --- /dev/null
 +++ b/src/providers/codex/models.rs
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,681 @@
 +//! The authenticated Codex catalog is the source of model IDs and lane metadata.
 +use std::sync::{LazyLock, RwLock};
 +use std::time::{Duration, Instant};
 +
 +use anyhow::{Result, ensure};
-+use serde::Deserialize;
++use serde::{Deserialize, Serialize};
++use serde_json::{Map, Value, json};
 +use tokio::sync::Mutex;
 +
 +use super::auth::{
@@ -100,7 +155,7 @@ index 0000000..c03e715
 +    token_store::{StoredAuth, file_store},
 +};
 +
-+#[derive(Clone, Debug, Deserialize)]
++#[derive(Clone, Debug, Deserialize, Serialize)]
 +pub struct Model {
 +    pub slug: String,
 +    #[serde(default)]
@@ -108,6 +163,91 @@ index 0000000..c03e715
 +    #[serde(default)]
 +    pub use_responses_lite: bool,
 +    pub visibility: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub default_reasoning_level: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub supported_reasoning_levels: Option<Vec<ReasoningLevel>>,
++    #[serde(flatten)]
++    pub metadata: Map<String, Value>,
++}
++
++#[derive(Clone, Debug, Deserialize, Serialize)]
++pub struct ReasoningLevel {
++    pub effort: String,
++    #[serde(default)]
++    pub description: String,
++}
++
++// Public capabilities only: model-owned prompts and internal tool configuration
++// are not part of the compatibility API.
++const PUBLIC_METADATA: &[&str] = &[
++    "display_name",
++    "description",
++    "context_window",
++    "max_context_window",
++    "auto_compact_token_limit",
++    "effective_context_window_percent",
++    "input_modalities",
++    "supports_image_detail_original",
++    "supports_reasoning_summary_parameter",
++    "default_reasoning_summary",
++    "supports_reasoning_effort_updates",
++    "support_verbosity",
++    "default_verbosity",
++    "supported_in_api",
++    "supports_search_tool",
++    "web_search_tool_type",
++    "service_tiers",
++    "default_service_tier",
++    "additional_speed_tiers",
++    "upgrade",
++    "model_specialty",
++];
++
++impl Model {
++    fn resolve_effort(&self, requested: Option<&str>) -> Result<Option<String>> {
++        let effort = requested.or(self.default_reasoning_level.as_deref());
++        if let Some(effort) = effort {
++            ensure!(!effort.is_empty(), "Reasoning effort must not be empty");
++            if let Some(levels) = &self.supported_reasoning_levels {
++                ensure!(
++                    levels.iter().any(|level| level.effort == effort),
++                    "Model '{}' does not support reasoning effort '{}'. Supported: {}",
++                    self.slug,
++                    effort,
++                    levels
++                        .iter()
++                        .map(|level| level.effort.as_str())
++                        .collect::<Vec<_>>()
++                        .join(", ")
++                );
++            }
++        }
++        Ok(effort.map(str::to_owned))
++    }
++
++    fn listing(&self, id: &str, is_default: bool) -> Value {
++        let mut entry = serde_json::to_value(self).unwrap();
++        entry["id"] = json!(id);
++        entry["type"] = json!("model");
++        entry["object"] = json!("model");
++        entry["owned_by"] = json!("openai");
++        entry["is_default"] = json!(is_default);
++        if id.starts_with("claude-") {
++            entry["behaves_as"] = json!("claude-fable-5-1");
++        }
++        // Codex's preset API calls these "efforts"; expose both spellings for clients.
++        if let Some(levels) = &self.supported_reasoning_levels {
++            entry["supported_reasoning_efforts"] = json!(levels);
++        }
++        if let Some(default) = &self.default_reasoning_level {
++            entry["default_reasoning_effort"] = json!(default);
++        }
++        if entry.get("display_name").is_none_or(Value::is_null) {
++            entry["display_name"] = json!(self.slug);
++        }
++        entry
++    }
 +}
 +
 +#[derive(Default, Deserialize)]
@@ -125,6 +265,12 @@ index 0000000..c03e715
 +                    .bytes()
 +                    .all(|c| c.is_ascii_alphanumeric() || b".-_".contains(&c))
 +        });
++        for model in &mut catalog.models {
++            model
++                .metadata
++                .retain(|key, _| PUBLIC_METADATA.contains(&key.as_str()));
++            model.resolve_effort(None)?;
++        }
 +        catalog
 +            .models
 +            .sort_by(|a, b| a.priority.cmp(&b.priority).then(a.slug.cmp(&b.slug)));
@@ -276,6 +422,43 @@ index 0000000..c03e715
 +        .unwrap_or_default()
 +}
 +
++pub fn listing(model: &str, id: &str) -> Option<Value> {
++    let cache = CATALOG.read().unwrap();
++    let catalog = &cache.as_ref()?.catalog;
++    let entry = catalog.models.iter().find(|entry| entry.slug == model)?;
++    Some(entry.listing(id, catalog.default_model() == Some(model)))
++}
++
++pub fn resolve_effort(model: &str, effort: Option<&str>) -> Result<Option<String>> {
++    let cache = CATALOG.read().unwrap();
++    if let Some(entry) = cache.as_ref().and_then(|cache| {
++        cache
++            .catalog
++            .models
++            .iter()
++            .find(|entry| entry.slug == model)
++    }) {
++        return entry.resolve_effort(effort);
++    }
++    Ok(effort.map(str::to_owned))
++}
++
++pub fn supports_reasoning_summary(model: &str) -> bool {
++    let cache = CATALOG.read().unwrap();
++    cache
++        .as_ref()
++        .and_then(|cache| {
++            cache
++                .catalog
++                .models
++                .iter()
++                .find(|entry| entry.slug == model)
++        })
++        .and_then(|entry| entry.metadata.get("supports_reasoning_summary_parameter"))
++        .and_then(Value::as_bool)
++        .unwrap_or(true)
++}
++
 +pub fn contains(model: &str) -> bool {
 +    CATALOG
 +        .read()
@@ -335,7 +518,18 @@ index 0000000..c03e715
 +    #[tokio::test]
 +    async fn discovery_catalog_routes_future_models_and_replaces_removed_models() {
 +        let body = json!({"models": [
-+            {"slug": "gpt-future-test", "visibility": "list", "priority": 0, "use_responses_lite": true},
++            {"slug": "gpt-future-test", "visibility": "list", "priority": 0, "use_responses_lite": true,
++             "display_name": "GPT Future", "description": "Future model",
++             "default_reasoning_level": "ultra", "supported_reasoning_levels": [
++                 {"effort": "low", "description": "Fast"},
++                 {"effort": "ultra", "description": "Deep"},
++                 {"effort": "future_effort", "description": "New level"},
++                 {"effort": "none"}, {"effort": "minimal"}, {"effort": "persistent"}],
++             "context_window": 400000, "auto_compact_token_limit": 350000,
++             "input_modalities": ["text", "image"], "support_verbosity": true,
++             "supports_reasoning_summary_parameter": false,
++             "service_tiers": [{"id": "priority", "name": "Fast", "description": "Fast service"}],
++             "base_instructions": "Private prompt", "model_messages": {"secret": "Internal"}},
 +            {"slug": "gpt-full-test", "visibility": "list", "priority": 1},
 +            {"slug": "gpt-hidden-test", "visibility": "hide", "priority": -1}
 +        ]});
@@ -377,6 +571,46 @@ index 0000000..c03e715
 +        .unwrap();
 +        assert_eq!(translated.model, "gpt-future-test");
 +        assert!(translated.use_responses_lite);
++        assert_eq!(translated.upstream["reasoning"]["effort"], "ultra");
++        use super::super::translate::request::{TranslateOptions, translate_request};
++        for requested in [
++            None,
++            Some("none"),
++            Some("minimal"),
++            Some("low"),
++            Some("ultra"),
++            Some("persistent"),
++            Some("future_effort"),
++        ] {
++            let expected = requested.unwrap_or("ultra");
++            let mut chat = json!({"model": "gpt-future-test",
++                "messages": [{"role": "user", "content": "hello"}]});
++            let mut messages = chat.clone();
++            let mut native = json!({"model": "gpt-future-test", "input": "hello"});
++            if let Some(effort) = requested {
++                chat["reasoning_effort"] = json!(effort);
++                messages["output_config"] = json!({"effort": effort});
++                native["reasoning"] = json!({"effort": effort});
++            }
++            let chat = super::super::chat_completions::request::translate_request(chat).unwrap();
++            assert_eq!(chat.upstream["reasoning"]["effort"], expected);
++            let req = serde_json::from_value(messages).unwrap();
++            let translated = translate_request(
++                &req,
++                TranslateOptions {
++                    model: "gpt-future-test".into(),
++                    use_responses_lite: true,
++                    session_id: None,
++                    service_tier: None,
++                },
++            )
++            .unwrap();
++            let wire = serde_json::to_value(translated).unwrap();
++            assert_eq!(wire["reasoning"]["effort"], expected);
++            assert!(wire["reasoning"].get("summary").is_none());
++            super::super::native::shape_native_request(&mut native).unwrap();
++            assert_eq!(native["reasoning"]["effort"], expected);
++        }
 +        assert!(
 +            super::super::native::validate_native_request_model(&json!({
 +                "model": "gpt-future-test", "input": "hello"
@@ -391,7 +625,50 @@ index 0000000..c03e715
 +        );
 +        use http_body_util::BodyExt;
 +        use tower::ServiceExt;
-+        let response = crate::server::app(std::sync::Arc::new(fixture_registry))
++        let app =
++            crate::server::app_with_options(std::sync::Arc::new(fixture_registry), None, true);
++        for (path, request) in [
++            (
++                "/v1/messages",
++                json!({"model": "claude-gpt-future-test", "max_tokens": 100,
++                "messages": [{"role": "user", "content": "hello"}], "output_config": {"effort": "high"}}),
++            ),
++            (
++                "/v1/chat/completions",
++                json!({"model": "gpt-future-test",
++                "messages": [{"role": "user", "content": "hello"}], "reasoning_effort": "high"}),
++            ),
++            (
++                "/v1/responses",
++                json!({"model": "gpt-future-test", "input": "hello",
++                "reasoning": {"effort": "high"}}),
++            ),
++        ] {
++            let response = app
++                .clone()
++                .oneshot(
++                    http::Request::builder()
++                        .method("POST")
++                        .uri(path)
++                        .header("content-type", "application/json")
++                        .body(axum::body::Body::from(request.to_string()))
++                        .unwrap(),
++                )
++                .await
++                .unwrap();
++            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST, "{path}");
++            let error: Value =
++                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
++                    .unwrap();
++            assert!(
++                error["error"]["message"]
++                    .as_str()
++                    .unwrap()
++                    .contains("does not support reasoning effort"),
++                "{error}"
++            );
++        }
++        let response = app
 +            .oneshot(
 +                http::Request::builder()
 +                    .uri("/v1/models")
@@ -406,6 +683,39 @@ index 0000000..c03e715
 +                .unwrap();
 +        assert!(body["data"].as_array().unwrap().iter().any(|entry|
 +            entry["id"] == "claude-gpt-future-test" && entry["is_default"] == true));
++
++        for id in ["gpt-future-test", "claude-gpt-future-test"] {
++            let entry = body["data"]
++                .as_array()
++                .unwrap()
++                .iter()
++                .find(|entry| entry["id"] == id)
++                .unwrap();
++            assert_eq!(entry["display_name"], "GPT Future");
++            assert_eq!(entry["description"], "Future model");
++            assert_eq!(entry["default_reasoning_effort"], "ultra");
++            assert_eq!(
++                entry["supported_reasoning_efforts"][2]["effort"],
++                "future_effort"
++            );
++            assert_eq!(
++                entry["supported_reasoning_levels"][0]["description"],
++                "Fast"
++            );
++            assert_eq!(entry["context_window"], 400000);
++            assert_eq!(entry["auto_compact_token_limit"], 350000);
++            assert_eq!(entry["input_modalities"], json!(["text", "image"]));
++            assert_eq!(entry["service_tiers"][0]["id"], "priority");
++            assert_eq!(entry["supports_reasoning_summary_parameter"], false);
++            assert_eq!(entry["is_default"], true);
++            if id.starts_with("claude-") {
++                assert_eq!(entry["behaves_as"], "claude-fable-5-1");
++            } else {
++                assert!(entry.get("behaves_as").is_none());
++            }
++            assert!(entry.get("base_instructions").is_none());
++            assert!(entry.get("model_messages").is_none());
++        }
 +
 +        assert_eq!(default_model(), "gpt-future-test");
 +        assert_eq!(advertised_models(), ["gpt-future-test", "gpt-full-test"]);
@@ -454,6 +764,52 @@ index 0000000..c03e715
 +    }
 +
 +    #[test]
++    fn effort_metadata_distinguishes_missing_from_unsupported() {
++        let catalog = Catalog::parse(
++            r#"{"models":[
++            {"slug":"gpt-legacy","visibility":"list"},
++            {"slug":"gpt-no-reasoning","visibility":"list","supported_reasoning_levels":[]}
++        ]}"#,
++        )
++        .unwrap();
++        let legacy = catalog
++            .models
++            .iter()
++            .find(|entry| entry.slug == "gpt-legacy")
++            .unwrap();
++        assert_eq!(legacy.resolve_effort(None).unwrap(), None);
++        assert_eq!(
++            legacy.resolve_effort(Some("high")).unwrap(),
++            Some("high".into())
++        );
++        assert!(
++            legacy
++                .listing("gpt-legacy", false)
++                .get("supported_reasoning_efforts")
++                .is_none()
++        );
++        let disabled = catalog
++            .models
++            .iter()
++            .find(|entry| entry.slug == "gpt-no-reasoning")
++            .unwrap();
++        assert_eq!(disabled.resolve_effort(None).unwrap(), None);
++        assert!(disabled.resolve_effort(Some("high")).is_err());
++        assert!(disabled.resolve_effort(Some("")).is_err());
++        assert_eq!(
++            disabled.listing("gpt-no-reasoning", false)["supported_reasoning_efforts"],
++            json!([])
++        );
++        assert!(
++            Catalog::parse(
++                r#"{"models":[{"slug":"gpt-invalid","visibility":"list",
++            "default_reasoning_level":"high","supported_reasoning_levels":[]}]}"#
++            )
++            .is_err()
++        );
++    }
++
++    #[test]
 +    fn discovery_rejects_invalid_and_empty_catalogs() {
 +        for body in [
 +            r#"{"models":[]}"#,
@@ -466,7 +822,7 @@ index 0000000..c03e715
 +    }
 +}
 diff --git a/src/providers/codex/native.rs b/src/providers/codex/native.rs
-index 63995b9..600b9c5 100644
+index 63995b9..a247fc0 100644
 --- a/src/providers/codex/native.rs
 +++ b/src/providers/codex/native.rs
 @@ -19,8 +19,7 @@ use crate::traffic::{
@@ -479,6 +835,15 @@ index 63995b9..600b9c5 100644
  };
  
  pub struct CodexNativeBackend {
+@@ -63,7 +62,7 @@ impl CodexNativeBackend {
+     }
+ }
+ 
+-struct NativeResolved {
++pub(super) struct NativeResolved {
+     model: String,
+     use_responses_lite: bool,
+     stream: bool,
 @@ -102,7 +101,7 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
              format!(
                  "Model '{requested}' resolves to unsupported model '{}'. Supported: {}",
@@ -488,7 +853,64 @@ index 63995b9..600b9c5 100644
              ),
              Some("model"),
              Some("model_not_supported"),
-@@ -141,15 +140,15 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
+@@ -112,7 +111,7 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
+ }
+ 
+ #[allow(clippy::result_large_err)]
+-fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
++pub(super) fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
+     let requested = validate_native_request_model(body)?;
+     let object = body
+         .as_object_mut()
+@@ -124,6 +123,47 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
+     if hosted_web_search {
+         model = full_lane_web_search_model(&model).to_string();
+     }
++    let requested_effort = match object.get("reasoning").filter(|value| !value.is_null()) {
++        None => None,
++        Some(Value::Object(reasoning)) => match reasoning.get("effort") {
++            None | Some(Value::Null) => None,
++            Some(Value::String(effort)) => Some(effort.as_str()),
++            Some(_) => {
++                return Err(openai_error(
++                    StatusCode::BAD_REQUEST,
++                    "invalid_request_error",
++                    "reasoning.effort must be a string",
++                    Some("reasoning.effort"),
++                    None,
++                ));
++            }
++        },
++        Some(_) => {
++            return Err(openai_error(
++                StatusCode::BAD_REQUEST,
++                "invalid_request_error",
++                "reasoning must be an object",
++                Some("reasoning"),
++                None,
++            ));
++        }
++    };
++    let effort = super::models::resolve_effort(&model, requested_effort).map_err(|error| {
++        openai_error(
++            StatusCode::BAD_REQUEST,
++            "invalid_request_error",
++            error.to_string(),
++            Some("reasoning.effort"),
++            Some("unsupported_value"),
++        )
++    })?;
++    if let Some(effort) = effort {
++        let reasoning = object.entry("reasoning").or_insert_with(|| json!({}));
++        if reasoning.is_null() {
++            *reasoning = json!({});
++        }
++        reasoning["effort"] = json!(effort);
++    }
+     object.insert("model".to_string(), Value::String(model.clone()));
+     if priority && !object.contains_key("service_tier") {
+         object.insert("service_tier".to_string(), json!("priority"));
+@@ -141,15 +181,15 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
  
  fn resolve_native_model(requested: &str) -> (String, bool) {
      let (requested, priority) = match requested.strip_suffix("-fast") {
@@ -721,6 +1143,138 @@ index bb4c062..aa8e078 100644
 +        || model.strip_suffix("-fast").is_some_and(models::contains)
 +        || crate::registry::is_anthropic_alias(model)
  }
+diff --git a/src/providers/codex/translate/request.rs b/src/providers/codex/translate/request.rs
+index da41635..b9e14f4 100644
+--- a/src/providers/codex/translate/request.rs
++++ b/src/providers/codex/translate/request.rs
+@@ -8,7 +8,6 @@ use crate::anthropic::schema::MessagesRequest;
+ use crate::config;
+ use crate::providers::translate_shared::{
+     ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
+-    read_effort,
+ };
+ 
+ use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
+@@ -22,22 +21,31 @@ use super::reasoning_signature::decode_reasoning_signature;
+ #[serde(rename_all = "snake_case")]
+ pub enum Effort {
+     None,
++    Minimal,
+     Low,
+     Medium,
+     High,
+     Xhigh,
+     Max,
++    Ultra,
++    Persistent,
++    #[serde(untagged)]
++    Custom(String),
+ }
+ 
+ impl std::fmt::Display for Effort {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
+             Effort::None => write!(f, "none"),
++            Effort::Minimal => write!(f, "minimal"),
+             Effort::Low => write!(f, "low"),
+             Effort::Medium => write!(f, "medium"),
+             Effort::High => write!(f, "high"),
+             Effort::Xhigh => write!(f, "xhigh"),
+             Effort::Max => write!(f, "max"),
++            Effort::Ultra => write!(f, "ultra"),
++            Effort::Persistent => write!(f, "persistent"),
++            Effort::Custom(value) => write!(f, "{value}"),
+         }
+     }
+ }
+@@ -273,6 +281,11 @@ pub(crate) fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
+         Some("low") => Some(Effort::Low),
+         Some("medium") => Some(Effort::Medium),
+         Some("high") => Some(Effort::High),
++        Some("none") => Some(Effort::None),
++        Some("minimal") => Some(Effort::Minimal),
++        Some("ultra") => Some(Effort::Ultra),
++        Some("persistent") => Some(Effort::Persistent),
++        Some(value) if !value.is_empty() => Some(Effort::Custom(value.to_owned())),
+         _ => None,
+     }
+ }
+@@ -286,20 +299,9 @@ pub(crate) fn resolve_effort_override(
+     override_effort: Option<&str>,
+ ) -> Result<Option<Effort>, anyhow::Error> {
+     if let Some(val) = override_effort {
+-        let valid = ["none", "low", "medium", "high", "xhigh", "max"];
+-        if !valid.contains(&val) {
+-            anyhow::bail!(
+-                "Invalid effort override: \"{val}\". Must be one of: none, low, medium, high, xhigh, max"
+-            );
+-        }
+-        return Ok(Some(match val {
+-            "max" => Effort::Max,
+-            "xhigh" => Effort::Xhigh,
+-            "high" => Effort::High,
+-            "medium" => Effort::Medium,
+-            "low" => Effort::Low,
+-            _ => Effort::None,
+-        }));
++        return to_codex_effort(Some(val))
++            .map(Some)
++            .ok_or_else(|| anyhow::anyhow!("Reasoning effort override must not be empty"));
+     }
+     Ok(effort)
+ }
+@@ -361,7 +363,10 @@ fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
+         None | Some("") => Some(Effort::Low),
+         Some("off") => None,
+         Some("none") => Some(Effort::None),
+-        Some(other) => to_codex_effort(Some(other)).or(Some(Effort::Low)),
++        Some(other) => match to_codex_effort(Some(other)) {
++            Some(Effort::Custom(_)) | None => Some(Effort::Low),
++            effort => effort,
++        },
+     }
+ }
+ 
+@@ -552,22 +557,36 @@ fn translate_request_inner(
+         }
+     }
+ 
+-    let effort = read_effort(req)?;
+-    let codex_effort = to_codex_effort(effort);
++    let effort = match req
++        .extra
++        .get("output_config")
++        .and_then(|value| value.get("effort"))
++    {
++        None | Some(Value::Null) => None,
++        Some(Value::String(value)) => Some(value.as_str()),
++        Some(_) => anyhow::bail!("output_config.effort must be a string"),
++    };
++    let effort = super::super::models::resolve_effort(&out.model, effort)?;
++    let codex_effort = to_codex_effort(effort.as_deref());
+     let mut resolved_effort = if apply_codex_config {
+         resolve_effort(codex_effort)?
+     } else {
+         codex_effort
+     };
++    let effort_value = resolved_effort.as_ref().map(ToString::to_string);
++    let validated = super::super::models::resolve_effort(&out.model, effort_value.as_deref())?;
++    resolved_effort = to_codex_effort(validated.as_deref());
+     if apply_codex_config
+         && is_compact
+         && let Some(cap) = compact_effort_cap()
+         && resolved_effort.as_ref().is_some_and(|e| *e > cap)
++        && super::super::models::resolve_effort(&out.model, Some(&cap.to_string())).is_ok()
+     {
+         resolved_effort = Some(cap);
+     }
+     if resolved_effort.is_some() || opts.use_responses_lite {
+-        let summary = if resolved_effort.is_some()
++        let summary = if super::super::models::supports_reasoning_summary(&out.model)
++            && resolved_effort.is_some()
+             && (!apply_codex_config
+                 || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
+         {
 diff --git a/src/registry.rs b/src/registry.rs
 index 77a9cf6..4e6897c 100644
 --- a/src/registry.rs
@@ -899,7 +1453,7 @@ index 77a9cf6..4e6897c 100644
  
      #[test]
 diff --git a/src/server.rs b/src/server.rs
-index bb563d9..9eb66d2 100644
+index bb563d9..909cc23 100644
 --- a/src/server.rs
 +++ b/src/server.rs
 @@ -34,7 +34,7 @@ use axum::{
@@ -911,7 +1465,7 @@ index bb563d9..9eb66d2 100644
      routing::{get, post},
  };
  use http_body_util::{BodyExt, StreamBody};
-@@ -318,20 +318,44 @@ struct ModelsQuery {
+@@ -318,20 +318,38 @@ struct ModelsQuery {
  async fn handler_models(
      State(state): State<Arc<AppState>>,
      Query(query): Query<ModelsQuery>,
@@ -932,36 +1486,33 @@ index bb563d9..9eb66d2 100644
          .into_iter()
 -        .map(|(model, provider)| {
 -            json!({
-+        .flat_map(|(model, provider)| {
-+            let raw = json!({
-                 "type": "model",
-                 "object": "model",
+-                "type": "model",
+-                "object": "model",
 -                "id": model,
-+                "id": &model,
-                 "display_name": format!("{model} ({provider})"),
+-                "display_name": format!("{model} ({provider})"),
 -            })
-+            });
-+            let compatibility_alias =
-+                (provider == "codex" && model.starts_with("gpt-")).then(|| {
++        .flat_map(|(model, provider)| {
++            let raw = crate::providers::codex::models::listing(&model, &model)
++                .filter(|_| provider == "codex")
++                .unwrap_or_else(|| {
 +                    json!({
-+                        "type": "model",
-+                        "object": "model",
-+                        "id": format!("claude-{model}"),
-+                        "display_name": &model,
++                        "type": "model", "object": "model", "id": &model,
++                        "display_name": format!("{model} ({provider})"),
 +                    })
 +                });
++            let compatibility_alias = (provider == "codex" && model.starts_with("gpt-"))
++                .then(|| {
++                    crate::providers::codex::models::listing(&model, &format!("claude-{model}"))
++                })
++                .flatten();
 +            std::iter::once(raw).chain(compatibility_alias)
          })
          .collect();
 +    data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-+    let default_model = crate::providers::codex::models::default_model();
-+    for entry in &mut data {
-+        entry["is_default"] = json!(entry["id"] == format!("claude-{default_model}"));
-+    }
      let has_more = query.limit.is_some_and(|limit| data.len() > limit);
      if let Some(limit) = query.limit {
          data.truncate(limit);
-@@ -343,6 +367,7 @@ async fn handler_models(
+@@ -343,6 +361,7 @@ async fn handler_models(
          "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
          "last_id": data.last().and_then(|entry| entry.get("id")).cloned(),
      }))
@@ -969,7 +1520,7 @@ index bb563d9..9eb66d2 100644
  }
  
  async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
-@@ -892,6 +917,17 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
+@@ -892,6 +911,17 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
      let affinity = session_state
          .as_ref()
          .and_then(|session| session.affinity_provider.as_ref());
@@ -987,7 +1538,7 @@ index bb563d9..9eb66d2 100644
      let Some(provider) = state
          .registry
          .provider_for_model(&normalized_model, affinity)
-@@ -1124,6 +1160,17 @@ async fn handler_chat_completions(
+@@ -1124,6 +1154,17 @@ async fn handler_chat_completions(
      let affinity = session_state
          .as_ref()
          .and_then(|session| session.affinity_provider.as_ref());
@@ -1005,7 +1556,7 @@ index bb563d9..9eb66d2 100644
      let Some(provider) = state
          .registry
          .provider_for_model(&normalized_model, affinity)
-@@ -1561,6 +1608,17 @@ async fn dispatch_request(
+@@ -1561,6 +1602,17 @@ async fn dispatch_request(
      let session_affinity = session_state
          .as_ref()
          .and_then(|state| state.affinity_provider.as_ref());

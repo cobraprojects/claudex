@@ -91,7 +91,7 @@ while IFS= read -r model; do
     }
     print label
   }')"
-  option="{\"model\":\"$model\",\"label\":\"$label\",\"description\":\"Codex subscription\",\"behavesAs\":\"fable\"}"
+  option="{\"model\":\"$model\",\"label\":\"$label\",\"description\":\"Codex subscription\",\"behavesAs\":\"claude-fable-5-1\"}"
   if [ -n "$model_options" ]; then
     model_options="$model_options,$option"
   else
