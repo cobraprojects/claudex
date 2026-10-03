@@ -9,9 +9,64 @@ if [ ! -x "$proxy" ]; then
   exit 1
 fi
 
+open_browser() {
+  if [ -n "${CLAUDEX_BROWSER_OPEN:-}" ]; then
+    "$CLAUDEX_BROWSER_OPEN" "$1"
+    return
+  fi
+  case "$(uname -s)" in
+    Darwin) open "$1" >/dev/null 2>&1 ;;
+    Linux)
+      if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$1" >/dev/null 2>&1
+      elif command -v gio >/dev/null 2>&1; then
+        gio open "$1" >/dev/null 2>&1
+      else
+        return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 case "${1:-}" in
-  login|logout)
-    exec "$proxy" codex auth "$1"
+  login)
+    login_output="$(mktemp "${TMPDIR:-/tmp}/claudex-login.XXXXXX")"
+    auth_pid=""
+    cleanup() {
+      if [ -n "$auth_pid" ]; then
+        kill "$auth_pid" >/dev/null 2>&1 || true
+        wait "$auth_pid" >/dev/null 2>&1 || true
+      fi
+      rm -f "$login_output"
+    }
+    trap cleanup EXIT
+    trap 'exit 1' HUP INT TERM
+    echo "claudex: signing in to ChatGPT" >&2
+    "$proxy" codex auth login >"$login_output" 2>&1 &
+    auth_pid=$!
+    auth_url=""
+    while kill -0 "$auth_pid" >/dev/null 2>&1; do
+      auth_url="$(sed -n 's/^[[:space:]]*\(https:\/\/[^[:space:]]*\)[[:space:]]*$/\1/p' "$login_output" | head -n 1)"
+      [ -z "$auth_url" ] || break
+      sleep 0.1
+    done
+    if [ -n "$auth_url" ]; then
+      printf 'claudex: complete sign-in at %s\n' "$auth_url" >&2
+      open_browser "$auth_url" || echo "claudex: open that URL in your browser to sign in" >&2
+    fi
+    if wait "$auth_pid"; then
+      auth_pid=""
+      echo "claudex: ChatGPT sign-in succeeded" >&2
+    else
+      auth_pid=""
+      cat "$login_output" >&2
+      echo "claudex: ChatGPT sign-in did not complete. Run claudex to try again." >&2
+      exit 1
+    fi
+    ;;
+  logout)
+    exec "$proxy" codex auth logout
     ;;
   *)
     echo "usage: gpt-auth login|logout" >&2

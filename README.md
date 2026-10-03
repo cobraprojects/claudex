@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/cobraprojects/claudex/main/install.
 The installer downloads a checksum-verified precompiled binary from GitHub
 Releases, configures a per-user background service, installs Claude Code from
 Anthropic's official installer when necessary, updates Claude Code if it is too
-old for the dynamic model picker, and opens the ChatGPT login flow. Client
+old for the dynamic model picker. Client
 machines do **not** need Rust, a compiler, or Homebrew. Claude Code is not
 pinned; the installer only requires version 2.1.261 or newer.
 
@@ -29,6 +29,12 @@ After installation, open a new terminal and run:
 ```bash
 claudex
 ```
+
+On first launch, Claudex opens the ChatGPT sign-in page before loading models.
+Complete sign-in in your browser and the launch continues automatically.
+Launching after logout follows the same flow. If saved credentials can no longer
+be refreshed, Claudex asks you to sign in again. Installation does not require
+sign-in; a cancelled or timed-out login can be retried by running `claudex`.
 
 Inside Claudex, manage the ChatGPT account used for GPT models with:
 

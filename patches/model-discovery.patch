@@ -1,3 +1,85 @@
+diff --git a/src/providers/codex/auth/manager.rs b/src/providers/codex/auth/manager.rs
+index 6a8981c..29a3536 100644
+--- a/src/providers/codex/auth/manager.rs
++++ b/src/providers/codex/auth/manager.rs
+@@ -13,6 +13,10 @@ use crate::auth::AuthStorage;
+ static CODEX_REFRESH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
+     LazyLock::new(|| Arc::new(AsyncMutex::new(())));
+ 
++#[derive(Debug, thiserror::Error)]
++#[error("Not authenticated. Run claudex to sign in with ChatGPT.")]
++pub struct AuthenticationRequired;
++
+ pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
+     pub store: CodexTokenStore<S>,
+     #[cfg(test)]
+@@ -50,9 +54,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
+     }
+ 
+     pub async fn get_auth(&self) -> Result<StoredAuth, anyhow::Error> {
+-        let stored = self.load_auth()?.ok_or_else(|| {
+-            anyhow::anyhow!("Not authenticated. Run: claude-code-proxy codex auth login")
+-        })?;
++        let stored = self.load_auth()?.ok_or(AuthenticationRequired)?;
+ 
+         if stored.expires > Self::now_ms() + REFRESH_MARGIN_MS {
+             return Ok(stored);
+@@ -89,9 +91,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
+         // Reload from durable storage after acquiring the single-flight lock.
+         // Another request may have rotated and persisted the token while this
+         // caller was waiting.
+-        let current = self
+-            .load_auth()?
+-            .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?;
++        let current = self.load_auth()?.ok_or(AuthenticationRequired)?;
+ 
+         if (!force && current.expires > Self::now_ms() + REFRESH_MARGIN_MS)
+             || rejected_access.is_some_and(|access| current.access != access)
+@@ -104,7 +104,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
+ 
+     async fn refresh_now(&self, current: &StoredAuth) -> Result<StoredAuth, anyhow::Error> {
+         if current.refresh.is_empty() {
+-            anyhow::bail!("No refresh token stored; re-authenticate");
++            return Err(AuthenticationRequired.into());
+         }
+ 
+         let form = [
+@@ -129,11 +129,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
+                 return Ok(latest);
+             }
+             self.store.clear_auth()?;
+-            let err_msg = resp
+-                .text()
+-                .await
+-                .unwrap_or_else(|_| "Token refresh unauthorized".to_string());
+-            anyhow::bail!("{err_msg}");
++            return Err(AuthenticationRequired.into());
+         }
+ 
+         if !resp.status().is_success() {
+@@ -227,6 +223,22 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn expired_credentials_without_refresh_require_sign_in() {
++        let store = test_store();
++        store
++            .save_auth(StoredAuth {
++                access: "expired".into(),
++                refresh: String::new(),
++                expires: 0,
++                account_id: None,
++            })
++            .unwrap();
++        let manager = CodexAuthManager::new(store);
++        let error = manager.get_auth().await.unwrap_err();
++        assert!(error.to_string().contains("Run claudex to sign in"));
++    }
++
+     #[tokio::test(flavor = "multi_thread")]
+     async fn concurrent_expired_auth_refreshes_once() {
+         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 diff --git a/src/providers/codex/chat_completions/request.rs b/src/providers/codex/chat_completions/request.rs
 index eeb2062..3021bc6 100644
 --- a/src/providers/codex/chat_completions/request.rs
@@ -136,10 +218,10 @@ index c09f930..47dc969 100644
          if let Err(e) = assert_allowed_model(&resolved.model) {
 diff --git a/src/providers/codex/models.rs b/src/providers/codex/models.rs
 new file mode 100644
-index 0000000..70cd51d
+index 0000000..6241acd
 --- /dev/null
 +++ b/src/providers/codex/models.rs
-@@ -0,0 +1,681 @@
+@@ -0,0 +1,686 @@
 +//! The authenticated Codex catalog is the source of model IDs and lane metadata.
 +use std::sync::{LazyLock, RwLock};
 +use std::time::{Duration, Instant};
@@ -345,6 +427,11 @@ index 0000000..70cd51d
 +    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
 +        auth = manager.force_refresh(&auth.access).await?;
 +        response = fetch(&client, &endpoint, &auth, &version).await?;
++    }
++    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
++        manager.store.clear_auth()?;
++        *CATALOG.write().unwrap() = None;
++        return Err(super::auth::manager::AuthenticationRequired.into());
 +    }
 +    let catalog = Catalog::parse(&response.error_for_status()?.text().await?)?;
 +    *CATALOG.write().unwrap() = Some(CachedCatalog {
@@ -1453,7 +1540,7 @@ index 77a9cf6..4e6897c 100644
  
      #[test]
 diff --git a/src/server.rs b/src/server.rs
-index bb563d9..909cc23 100644
+index bb563d9..8df5fa5 100644
 --- a/src/server.rs
 +++ b/src/server.rs
 @@ -34,7 +34,7 @@ use axum::{
@@ -1465,7 +1552,30 @@ index bb563d9..909cc23 100644
      routing::{get, post},
  };
  use http_body_util::{BodyExt, StreamBody};
-@@ -318,20 +318,38 @@ struct ModelsQuery {
+@@ -310,6 +310,22 @@ struct ModelsQuery {
+     limit: Option<usize>,
+ }
+ 
++fn model_discovery_error(error: anyhow::Error) -> Response {
++    if error.is::<crate::providers::codex::auth::manager::AuthenticationRequired>() {
++        json_error(
++            StatusCode::UNAUTHORIZED,
++            "authentication_error",
++            error.to_string(),
++        )
++    } else {
++        json_error(
++            StatusCode::BAD_GATEWAY,
++            "model_discovery_error",
++            error.to_string(),
++        )
++    }
++}
++
+ /// Anthropic-shaped model listing so Claude Code's gateway model discovery
+ /// (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) finds the proxy's models.
+ /// Claude Code only adds entries whose id starts with `claude` or `anthropic`,
+@@ -318,20 +334,34 @@ struct ModelsQuery {
  async fn handler_models(
      State(state): State<Arc<AppState>>,
      Query(query): Query<ModelsQuery>,
@@ -1473,11 +1583,7 @@ index bb563d9..909cc23 100644
 +) -> Response {
 +    if state.registry.discovers_codex() {
 +        if let Err(error) = crate::providers::codex::models::refresh(true).await {
-+            return json_error(
-+                StatusCode::BAD_GATEWAY,
-+                "model_discovery_error",
-+                error.to_string(),
-+            );
++            return model_discovery_error(error);
 +        }
 +    }
      let mut data: Vec<Value> = state
@@ -1512,7 +1618,7 @@ index bb563d9..909cc23 100644
      let has_more = query.limit.is_some_and(|limit| data.len() > limit);
      if let Some(limit) = query.limit {
          data.truncate(limit);
-@@ -343,6 +361,7 @@ async fn handler_models(
+@@ -343,6 +373,7 @@ async fn handler_models(
          "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
          "last_id": data.last().and_then(|entry| entry.get("id")).cloned(),
      }))
@@ -1520,7 +1626,7 @@ index bb563d9..909cc23 100644
  }
  
  async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
-@@ -892,6 +911,17 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
+@@ -892,6 +923,13 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
      let affinity = session_state
          .as_ref()
          .and_then(|session| session.affinity_provider.as_ref());
@@ -1529,16 +1635,12 @@ index bb563d9..909cc23 100644
 +        .refresh_codex_for_model(&normalized_model, affinity)
 +        .await
 +    {
-+        return json_error(
-+            StatusCode::BAD_GATEWAY,
-+            "model_discovery_error",
-+            error.to_string(),
-+        );
++        return model_discovery_error(error);
 +    }
      let Some(provider) = state
          .registry
          .provider_for_model(&normalized_model, affinity)
-@@ -1124,6 +1154,17 @@ async fn handler_chat_completions(
+@@ -1124,6 +1162,13 @@ async fn handler_chat_completions(
      let affinity = session_state
          .as_ref()
          .and_then(|session| session.affinity_provider.as_ref());
@@ -1547,16 +1649,12 @@ index bb563d9..909cc23 100644
 +        .refresh_codex_for_model(&normalized_model, affinity)
 +        .await
 +    {
-+        return json_error(
-+            StatusCode::BAD_GATEWAY,
-+            "model_discovery_error",
-+            error.to_string(),
-+        );
++        return model_discovery_error(error);
 +    }
      let Some(provider) = state
          .registry
          .provider_for_model(&normalized_model, affinity)
-@@ -1561,6 +1602,17 @@ async fn dispatch_request(
+@@ -1561,6 +1606,13 @@ async fn dispatch_request(
      let session_affinity = session_state
          .as_ref()
          .and_then(|state| state.affinity_provider.as_ref());
@@ -1565,12 +1663,50 @@ index bb563d9..909cc23 100644
 +        .refresh_codex_for_model(&normalized_model, session_affinity)
 +        .await
 +    {
-+        return json_error(
-+            StatusCode::BAD_GATEWAY,
-+            "model_discovery_error",
-+            error.to_string(),
-+        );
++        return model_discovery_error(error);
 +    }
      let original_provider = state
          .registry
          .provider_for_model(&normalized_model, session_affinity);
+@@ -2276,3 +2328,41 @@ mod auto_review_tests {
+         assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-sol"));
+     }
+ }
++
++#[cfg(test)]
++mod model_discovery_tests {
++    use super::*;
++    use http_body_util::BodyExt;
++
++    #[tokio::test]
++    async fn missing_credentials_return_an_actionable_401() {
++        use crate::auth::InMemoryAuthStore;
++        use crate::providers::codex::auth::{
++            manager::CodexAuthManager, token_store::CodexTokenStore,
++        };
++        let manager = CodexAuthManager::new(CodexTokenStore::new(InMemoryAuthStore::new()));
++        let response = model_discovery_error(manager.get_auth().await.unwrap_err());
++        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
++        let body: Value =
++            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
++                .unwrap();
++        assert_eq!(body["error"]["type"], "authentication_error");
++        assert!(
++            body["error"]["message"]
++                .as_str()
++                .unwrap()
++                .contains("Run claudex to sign in")
++        );
++    }
++
++    #[tokio::test]
++    async fn catalog_outages_remain_gateway_errors() {
++        let response = model_discovery_error(anyhow::anyhow!("Codex catalog is unavailable"));
++        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
++        let body: Value =
++            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
++                .unwrap();
++        assert_eq!(body["error"]["type"], "model_discovery_error");
++        assert_eq!(body["error"]["message"], "Codex catalog is unavailable");
++    }
++}

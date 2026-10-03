@@ -43,6 +43,8 @@ jobs:
           cargo fmt --manifest-path upstream/Cargo.toml --check
           cargo test --manifest-path upstream/Cargo.toml normalize_model_trims_hint --lib -- --test-threads=4
           cargo test --manifest-path upstream/Cargo.toml providers::codex::models::tests --lib -- --test-threads=4
+          cargo test --manifest-path upstream/Cargo.toml providers::codex::auth::manager::tests --lib -- --test-threads=4
+          cargo test --manifest-path upstream/Cargo.toml model_discovery_tests --lib -- --test-threads=4
           cargo test --manifest-path upstream/Cargo.toml providers::codex::translate::request::tests --lib -- --test-threads=4
           node --test --test-concurrency=4 tests/launcher.test.mjs
           cargo build --manifest-path upstream/Cargo.toml --release --locked

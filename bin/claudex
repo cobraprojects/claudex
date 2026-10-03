@@ -5,6 +5,7 @@ base_url="${CLAUDEX_BASE_URL:-http://127.0.0.1:18765}"
 proxy="$HOME/.local/share/claudex/bin/claude-code-proxy"
 plugin="$HOME/.local/share/claudex/plugin"
 label="com.cobraprojects.claudex-proxy"
+auth="$plugin/scripts/gpt-auth"
 
 proxy_ready() {
   curl -fsS --max-time 2 "$base_url/healthz" >/dev/null 2>&1
@@ -28,6 +29,10 @@ start_proxy() {
   esac
 }
 
+if ! "$proxy" codex auth status >/dev/null 2>&1; then
+  "$auth" login || exit 1
+fi
+
 if ! proxy_ready; then
   start_proxy
   attempt=0
@@ -41,7 +46,28 @@ if ! proxy_ready; then
   done
 fi
 
-models="$(curl -fsS --max-time 75 "$base_url/v1/models?limit=1000")"
+catalog_file="$(mktemp "${TMPDIR:-/tmp}/claudex-models.XXXXXX")"
+trap 'rm -f "$catalog_file"' EXIT HUP INT TERM
+fetch_models() {
+  if ! catalog_status="$(curl -sS --max-time 75 -o "$catalog_file" -w '%{http_code}' "$base_url/v1/models?limit=1000")"; then
+    echo "claudex: could not connect to the model catalog at $base_url" >&2
+    exit 1
+  fi
+}
+fetch_models
+if [ "$catalog_status" = 401 ]; then
+  "$auth" login || exit 1
+  fetch_models
+fi
+if [ "$catalog_status" != 200 ]; then
+  printf 'claudex: could not load Codex models (HTTP %s): ' "$catalog_status" >&2
+  cat "$catalog_file" >&2
+  printf '\n' >&2
+  exit 1
+fi
+models="$(cat "$catalog_file")"
+rm -f "$catalog_file"
+trap - EXIT HUP INT TERM
 model_ids="$(printf '%s\n' "$models" \
   | tr '{' '\n' \
   | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\(claude-gpt-[A-Za-z0-9._-]*\)".*/\1/p' \

@@ -183,18 +183,8 @@ if ! version_at_least "$claude_version" "$minimum_claude_version"; then
     || fail "Claude Code $minimum_claude_version or newer is required"
 fi
 
-if "$proxy" codex auth status >/dev/null 2>&1; then
-  say "Codex authentication is already configured"
-else
-  say "opening the ChatGPT/Codex login flow"
-  "$proxy" codex auth login
-fi
-
-models="$(curl -fsS --max-time 75 "$base_url/v1/models?limit=1000")" \
-  || fail "could not discover models from Codex"
-printf '%s\n' "$models" | grep -q '"id":"claude-gpt-' \
-  || fail "Codex did not advertise any GPT models for this account"
-
+# Authentication belongs to startup, so installation succeeds before sign-in.
+# The launcher opens the same login flow used by /gpt-login when needed.
 say "installed successfully"
 say "open a new terminal or run: export PATH=\"$HOME/.local/bin:\$PATH\""
 say "then launch: claudex"
