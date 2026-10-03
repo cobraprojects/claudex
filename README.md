@@ -99,6 +99,25 @@ discovery alone cannot add an effort selector to their UI. Claude Code's
 `/effort` menu still follows its Fable compatibility profile and cannot expose
 every GPT-specific level.
 
+## T3 Code
+
+For automatic model and effort discovery, add a provider instance in T3's
+Settings → Providers using the **Cursor** driver, name it **Claudex ACP**, and
+set its binary path to `~/.local/bin/claudex` (or the full path to that file).
+Leave the API endpoint empty. Select models from **Claudex ACP** in new threads.
+No custom model entries or manual effort definitions are needed.
+
+This uses the existing driver's ACP discovery protocol. Claudex continues to
+run Claude Code through the standard Claude Agent ACP adapter; it does not
+use Cursor's runtime or subscription. Installation includes a standalone ACP
+executable, so users do not need Node, Bun, or npm.
+
+T3's Claude driver does not consume runtime model discovery. Existing threads
+using that driver retain their connection; start a new thread with Claudex ACP.
+T3's Cursor driver displays `low`, `medium`, `high`, `xhigh`, and `max` when
+the selected model supports them. The full GPT catalog is returned, but that
+driver currently ignores GPT-only effort levels such as `ultra`.
+
 ## Ultracode workflows
 
 Every discovered GPT model uses Claude Code's `claude-fable-5-1` capability profile, which

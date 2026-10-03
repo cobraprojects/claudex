@@ -1,3 +1,5 @@
 .DS_Store
 dist/
 target/
+node_modules/
+/claudex-acp

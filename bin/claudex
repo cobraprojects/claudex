@@ -46,6 +46,17 @@ if ! proxy_ready; then
   done
 fi
 
+case "${1:-}" in
+  acp|about)
+    exec "$HOME/.local/share/claudex/bin/claudex-acp" "$@"
+    ;;
+  --force|--auto-review)
+    if [ "${2:-}" = acp ]; then
+      exec "$HOME/.local/share/claudex/bin/claudex-acp" "$@"
+    fi
+    ;;
+esac
+
 catalog_file="$(mktemp "${TMPDIR:-/tmp}/claudex-models.XXXXXX")"
 trap 'rm -f "$catalog_file"' EXIT HUP INT TERM
 fetch_models() {

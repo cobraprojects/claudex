@@ -31,6 +31,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+
+      - name: Build ACP connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --prefix acp --omit=optional --ignore-scripts
+          bun build --compile acp/index.mjs --outfile claudex-acp
+          node --test --test-concurrency=4 tests/acp.test.mjs
+
       - name: Build patched proxy
         shell: bash
         run: |
@@ -56,11 +68,12 @@ jobs:
           mkdir -p package
           cp upstream/target/release/claude-code-proxy package/claude-code-proxy
           cp bin/claudex package/claudex
+          cp claudex-acp package/claudex-acp
           cp -R plugin package/plugin
-          chmod 755 package/claude-code-proxy package/claudex \
+          chmod 755 package/claude-code-proxy package/claudex package/claudex-acp \
             package/plugin/scripts/gpt-auth package/plugin/scripts/gpt-auth-hook
           tar -C package -czf "claudex-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" \
-            claude-code-proxy claudex plugin
+            claude-code-proxy claudex claudex-acp plugin
 
       - uses: actions/upload-artifact@v7
         with:
